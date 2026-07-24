@@ -1,0 +1,19 @@
+apiVersion: paas.sh/v1alpha1
+kind: App
+metadata:
+  name: hello
+  namespace: tenants
+spec:
+  owner: pawan
+  port: 8080
+  replicas: 1
+---
+apiVersion: paas.sh/v1alpha1
+kind: Release
+metadata:
+  name: hello-r1
+  namespace: tenants
+spec:
+  app: hello
+  image: registry.local:5000/hello:isotest
+  gitSHA: manual-m1

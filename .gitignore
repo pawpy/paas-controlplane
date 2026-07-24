@@ -1,0 +1,5 @@
+# compiled binary (same name as the module) + build artifacts
+/paas-controlplane
+*.test
+*.out
+bin/
