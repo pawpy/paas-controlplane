@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"time"
 
@@ -9,6 +11,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -48,8 +51,8 @@ type backing struct {
 
 // +kubebuilder:rbac:groups=paas.sh,resources=stacks,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=paas.sh,resources=stacks/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=services;secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=postgresql.cnpg.io,resources=clusters,verbs=get;list;watch;create;update;patch;delete
 
@@ -151,8 +154,15 @@ func (r *StackReconciler) reconcileBacking(ctx context.Context, stack *paasv1.St
 			}
 			s := secret
 			out[b.Name] = backing{ready: ready, env: func(as string) []corev1.EnvVar { return postgresEnv(s, as) }}
+		case "valkey", "redis":
+			ready, secret, err := r.reconcileValkey(ctx, stack, b)
+			if err != nil {
+				return nil, err
+			}
+			s := secret
+			out[b.Name] = backing{ready: ready, env: func(as string) []corev1.EnvVar { return valkeyEnv(s, as) }}
 		default:
-			l.Info("backing type not yet supported (M5b-2/3)", "name", b.Name, "type", b.Type)
+			l.Info("backing type not yet supported (see backing-services catalog)", "name", b.Name, "type", b.Type)
 		}
 	}
 	return out, nil
@@ -207,18 +217,159 @@ func (r *StackReconciler) reconcilePostgres(ctx context.Context, stack *paasv1.S
 // the discrete PG* vars are injected too (both sourced from the CNPG app Secret,
 // by reference, so credentials never land in the Deployment spec).
 func postgresEnv(secret, as string) []corev1.EnvVar {
-	ref := func(key string) *corev1.EnvVarSource {
-		return &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-			LocalObjectReference: corev1.LocalObjectReference{Name: secret}, Key: key,
-		}}
-	}
 	return []corev1.EnvVar{
-		{Name: as, ValueFrom: ref("uri")},
-		{Name: "PGHOST", ValueFrom: ref("host")},
-		{Name: "PGPORT", ValueFrom: ref("port")},
-		{Name: "PGDATABASE", ValueFrom: ref("dbname")},
-		{Name: "PGUSER", ValueFrom: ref("user")},
-		{Name: "PGPASSWORD", ValueFrom: ref("password")},
+		{Name: as, ValueFrom: secretRef(secret, "uri")},
+		{Name: "PGHOST", ValueFrom: secretRef(secret, "host")},
+		{Name: "PGPORT", ValueFrom: secretRef(secret, "port")},
+		{Name: "PGDATABASE", ValueFrom: secretRef(secret, "dbname")},
+		{Name: "PGUSER", ValueFrom: secretRef(secret, "user")},
+		{Name: "PGPASSWORD", ValueFrom: secretRef(secret, "password")},
+	}
+}
+
+// reconcileValkey provisions a Valkey (open-source Redis fork) as a plain
+// StatefulSet + headless Service + generated-password Secret. No operator: a
+// single-node cache/queue does not need one (this is the template-backed
+// adapter, contrast reconcilePostgres which drives the CNPG operator).
+func (r *StackReconciler) reconcileValkey(ctx context.Context, stack *paasv1.Stack, b *paasv1.BackingSpec) (ready bool, secretName string, err error) {
+	name := fmt.Sprintf("%s-%s", stack.Name, b.Name)
+	labels := map[string]string{"paas.sh/stack": stack.Name, "paas.sh/backing": b.Name}
+	host := fmt.Sprintf("%s.%s.svc.cluster.local", name, stack.Namespace)
+
+	// 1) Secret: generate the password once, then keep it stable.
+	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: stack.Namespace}}
+	if _, err = controllerutil.CreateOrUpdate(ctx, r.Client, sec, func() error {
+		if sec.Data == nil {
+			sec.Data = map[string][]byte{}
+		}
+		// Generate the password once; derive the rest from it every reconcile so
+		// format fixes propagate to existing secrets.
+		if len(sec.Data["password"]) == 0 {
+			sec.Data["password"] = []byte(randomPassword())
+		}
+		pw := string(sec.Data["password"])
+		sec.Data["host"] = []byte(host)
+		sec.Data["port"] = []byte("6379")
+		// Username "default" is required: valkey-cli -u treats an empty userinfo
+		// user as an ACL username and sends AUTH ""<pw>, which requirepass rejects.
+		sec.Data["url"] = []byte(fmt.Sprintf("redis://default:%s@%s:6379/0", pw, host))
+		return controllerutil.SetControllerReference(stack, sec, r.Scheme)
+	}); err != nil {
+		return false, "", fmt.Errorf("valkey secret: %w", err)
+	}
+
+	// 2) Headless Service.
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: stack.Namespace}}
+	if _, err = controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
+		svc.Labels = labels
+		svc.Spec.ClusterIP = corev1.ClusterIPNone
+		svc.Spec.Selector = labels
+		svc.Spec.Ports = []corev1.ServicePort{{Name: "redis", Port: 6379, TargetPort: intstr.FromInt32(6379)}}
+		return controllerutil.SetControllerReference(stack, svc, r.Scheme)
+	}); err != nil {
+		return false, "", fmt.Errorf("valkey service: %w", err)
+	}
+
+	// 3) StatefulSet with a data PVC (Sidekiq/Celery use Redis as a queue, so
+	// persist AOF rather than run purely in-memory). PVC is removed on teardown.
+	disk := b.Disk
+	if disk == "" {
+		disk = "1Gi"
+	}
+	version := b.Version
+	if version == "" {
+		version = "8"
+	}
+	replicas := int32(1)
+	ss := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: stack.Namespace}}
+	if _, err = controllerutil.CreateOrUpdate(ctx, r.Client, ss, func() error {
+		ss.Labels = labels
+		ss.Spec.ServiceName = name
+		ss.Spec.Replicas = &replicas
+		ss.Spec.Selector = &metav1.LabelSelector{MatchLabels: labels}
+		ss.Spec.PersistentVolumeClaimRetentionPolicy = &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
+			WhenDeleted: appsv1.DeletePersistentVolumeClaimRetentionPolicyType,
+		}
+		ss.Spec.Template.ObjectMeta.Labels = labels
+		ss.Spec.Template.Spec.AutomountServiceAccountToken = ptr(false)
+		ss.Spec.Template.Spec.Tolerations = r.tolerations()
+		// Run as the image's valkey user (uid 999/gid 1000) so the entrypoint
+		// skips its root-only chown (which our drop-ALL-caps blocks); fsGroup
+		// makes the Ceph data volume writable by that group.
+		ss.Spec.Template.Spec.SecurityContext = &corev1.PodSecurityContext{
+			RunAsUser:    ptr(int64(999)),
+			RunAsGroup:   ptr(int64(1000)),
+			FSGroup:      ptr(int64(1000)),
+			RunAsNonRoot: ptr(true),
+		}
+		ss.Spec.Template.Spec.Containers = []corev1.Container{{
+			Name:            "valkey",
+			Image:           "valkey/valkey:" + version + "-alpine",
+			ImagePullPolicy: corev1.PullIfNotPresent,
+			// The image entrypoint prepends `valkey-server` to leading-dash args.
+			// $(VALKEY_PASSWORD) is expanded by the kubelet from the env below.
+			Args:      []string{"--requirepass", "$(VALKEY_PASSWORD)", "--appendonly", "yes"},
+			Env:       []corev1.EnvVar{{Name: "VALKEY_PASSWORD", ValueFrom: secretRef(name, "password")}},
+			Ports:     []corev1.ContainerPort{{ContainerPort: 6379, Name: "redis"}},
+			Resources: fixedResources("100m", "256Mi"),
+			VolumeMounts: []corev1.VolumeMount{{Name: "data", MountPath: "/data"}},
+			SecurityContext: hardenedSecurityContext(),
+		}}
+		ss.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{{
+			ObjectMeta: metav1.ObjectMeta{Name: "data"},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				StorageClassName: ptr("ceph-block"),
+				Resources:        corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resourceQty(disk)}},
+			},
+		}}
+		return controllerutil.SetControllerReference(stack, ss, r.Scheme)
+	}); err != nil {
+		return false, "", fmt.Errorf("valkey statefulset: %w", err)
+	}
+
+	return ss.Status.ReadyReplicas >= 1, name, nil
+}
+
+// valkeyEnv binds a valkey/redis connection: `as` gets the full redis:// URL,
+// plus the discrete REDIS_* vars, all by Secret reference.
+func valkeyEnv(secret, as string) []corev1.EnvVar {
+	return []corev1.EnvVar{
+		{Name: as, ValueFrom: secretRef(secret, "url")},
+		{Name: "REDIS_HOST", ValueFrom: secretRef(secret, "host")},
+		{Name: "REDIS_PORT", ValueFrom: secretRef(secret, "port")},
+		{Name: "REDIS_PASSWORD", ValueFrom: secretRef(secret, "password")},
+	}
+}
+
+func secretRef(name, key string) *corev1.EnvVarSource {
+	return &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: name}, Key: key,
+	}}
+}
+
+// randomPassword returns hex (not base64url): hex is safe inside a redis:// URL
+// with no special/leading-dash characters that trip URL parsers.
+func randomPassword() string {
+	b := make([]byte, 24)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func resourceQty(s string) resource.Quantity { return resource.MustParse(s) }
+
+// fixedResources is a small ceiling for template-backed backing services (low
+// requests so the tenant pool overcommits; limits are the ceiling).
+func fixedResources(cpuLimit, memLimit string) corev1.ResourceRequirements {
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("50m"),
+			corev1.ResourceMemory: resource.MustParse("64Mi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(cpuLimit),
+			corev1.ResourceMemory: resource.MustParse(memLimit),
+		},
 	}
 }
 
