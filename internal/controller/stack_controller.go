@@ -3,13 +3,16 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -20,15 +23,27 @@ import (
 	paasv1 "github.com/pawpy/paas-controlplane/api/v1alpha1"
 )
 
-// StackReconciler drives a Stack toward: for each service, a release Job run to
-// completion (if it has a release hook) and then a Deployment per process (+ a
-// Service for processes with a port). Backing services and cross-namespace
-// connection wiring are M5b; here, intra-stack service connections are resolved
-// to internal URLs.
+// cnpgClusterGVK is the CloudNativePG Cluster type. Referenced as unstructured so
+// this operator does not take a build dependency on the CNPG module.
+var cnpgClusterGVK = schema.GroupVersionKind{Group: "postgresql.cnpg.io", Version: "v1", Kind: "Cluster"}
+
+// StackReconciler drives a Stack toward: backing data services (self-hosted via
+// operators), then for each service a release Job (if it has a release hook) run
+// to completion, then a Deployment per process (+ a Service for ported
+// processes). Typed connections resolve to an internal URL (intra-stack) or to
+// credentials injected from the backing service's Secret.
 type StackReconciler struct {
 	client.Client
 	Scheme               *runtime.Scheme
 	TolerateControlPlane bool
+}
+
+// backing is a provisioned data service: whether it is ready to serve, and how a
+// connection to it turns into container env for a consumer.
+type backing struct {
+	ready bool
+	// env returns the env vars to inject for a connection `as` this name.
+	env func(as string) []corev1.EnvVar
 }
 
 // +kubebuilder:rbac:groups=paas.sh,resources=stacks,verbs=get;list;watch;create;update;patch;delete
@@ -36,6 +51,7 @@ type StackReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=postgresql.cnpg.io,resources=clusters,verbs=get;list;watch;create;update;patch;delete
 
 func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
@@ -45,31 +61,56 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	// 1) Provision backing services and learn how to bind connections to them.
+	backings, err := r.reconcileBacking(ctx, &stack)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	internalURLs := serviceURLs(&stack)
-	releasePending, releaseFailed := false, false
-	var deployed int32
+	releasePending, releaseFailed, backingPending := false, false, false
 
 	for i := range stack.Spec.Services {
 		svc := &stack.Spec.Services[i]
 		if svc.Image == "" {
-			// Build (repo -> image) is not wired yet; skip imageless services.
 			l.Info("service has no image, skipping until build is wired", "service", svc.Name)
 			continue
 		}
 		image := normalizeImage(svc.Image)
 
-		// Env shared by this service's processes: service env + resolved
-		// intra-stack connection URLs. Backing-service connections are M5b.
-		baseEnv := append([]paasv1.EnvVar{}, svc.Env...)
+		// Resolve connections into env. Intra-stack service edges become an
+		// internal URL; backing edges become credentials from the backing
+		// Secret. A service whose backing is not ready yet is held back.
+		svcEnv := envFromSpec(svc.Env)
+		waitBacking := false
 		for _, c := range svc.Connections {
-			if url, ok := internalURLs[c.To]; ok && c.As != "" {
-				baseEnv = append(baseEnv, paasv1.EnvVar{Name: c.As, Value: url})
+			if url, ok := internalURLs[c.To]; ok {
+				if c.As != "" {
+					svcEnv = append(svcEnv, corev1.EnvVar{Name: c.As, Value: url})
+				}
+				continue
 			}
+			if b, ok := backings[c.To]; ok {
+				if !b.ready {
+					waitBacking = true
+					continue
+				}
+				if c.As != "" {
+					svcEnv = append(svcEnv, b.env(c.As)...)
+				}
+				continue
+			}
+			l.Info("connection target not found", "service", svc.Name, "to", c.To)
+		}
+		if waitBacking {
+			backingPending = true
+			continue // hold the service (and its migration) until the DB is up
 		}
 
-		// Release hook gates the rollout: run it to completion first.
+		// Release hook gates the rollout: run it to completion first. It gets the
+		// resolved connection env, so migrations reach the (now-ready) database.
 		if svc.Hooks != nil && svc.Hooks.Release != "" {
-			done, failed, err := r.reconcileReleaseJob(ctx, &stack, svc, image, baseEnv)
+			done, failed, err := r.reconcileReleaseJob(ctx, &stack, svc, image, svcEnv)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
@@ -85,19 +126,105 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 
 		for j := range svc.Processes {
 			p := &svc.Processes[j]
-			if err := r.reconcileProcess(ctx, &stack, svc, p, image, baseEnv); err != nil {
+			if err := r.reconcileProcess(ctx, &stack, svc, p, image, svcEnv); err != nil {
 				return ctrl.Result{}, fmt.Errorf("service %s process %s: %w", svc.Name, p.Name, err)
 			}
-			deployed++
 		}
 	}
 
-	return r.updateStatus(ctx, &stack, releasePending, releaseFailed)
+	return r.updateStatus(ctx, &stack, backingPending, releasePending, releaseFailed)
+}
+
+// reconcileBacking ensures each backing service exists and reports readiness +
+// how to bind it. M5b-1 implements postgres (CloudNativePG); valkey and object
+// storage follow in M5b-2/3.
+func (r *StackReconciler) reconcileBacking(ctx context.Context, stack *paasv1.Stack) (map[string]backing, error) {
+	l := log.FromContext(ctx)
+	out := map[string]backing{}
+	for i := range stack.Spec.Backing {
+		b := &stack.Spec.Backing[i]
+		switch b.Type {
+		case "postgres":
+			ready, secret, err := r.reconcilePostgres(ctx, stack, b)
+			if err != nil {
+				return nil, err
+			}
+			s := secret
+			out[b.Name] = backing{ready: ready, env: func(as string) []corev1.EnvVar { return postgresEnv(s, as) }}
+		default:
+			l.Info("backing type not yet supported (M5b-2/3)", "name", b.Name, "type", b.Type)
+		}
+	}
+	return out, nil
+}
+
+// reconcilePostgres ensures a CloudNativePG Cluster for a postgres backing and
+// returns readiness + the app Secret name. The image comes from the version for
+// now; it moves behind the registry.local mirror in M5b-4.
+func (r *StackReconciler) reconcilePostgres(ctx context.Context, stack *paasv1.Stack, b *paasv1.BackingSpec) (ready bool, secretName string, err error) {
+	name := fmt.Sprintf("%s-%s", stack.Name, b.Name)
+	disk := b.Disk
+	if disk == "" {
+		disk = "1Gi"
+	}
+
+	cl := &unstructured.Unstructured{}
+	cl.SetGroupVersionKind(cnpgClusterGVK)
+	cl.SetNamespace(stack.Namespace)
+	cl.SetName(name)
+	if _, err = controllerutil.CreateOrUpdate(ctx, r.Client, cl, func() error {
+		// Set only the fields we own so CNPG's spec defaulting is preserved
+		// (wholesale spec replacement would fight the operator and thrash).
+		_ = unstructured.SetNestedField(cl.Object, int64(1), "spec", "instances")
+		_ = unstructured.SetNestedField(cl.Object, disk, "spec", "storage", "size")
+		_ = unstructured.SetNestedField(cl.Object, "ceph-block", "spec", "storage", "storageClass")
+		_ = unstructured.SetNestedField(cl.Object, "app", "spec", "bootstrap", "initdb", "database")
+		_ = unstructured.SetNestedField(cl.Object, "app", "spec", "bootstrap", "initdb", "owner")
+		if b.Version != "" {
+			_ = unstructured.SetNestedField(cl.Object, "ghcr.io/cloudnative-pg/postgresql:"+b.Version, "spec", "imageName")
+		}
+		// Single converged box: CNPG's Postgres pods must tolerate the
+		// control-plane taint (CNPG places tolerations under spec.affinity).
+		if r.TolerateControlPlane {
+			_ = unstructured.SetNestedSlice(cl.Object, []interface{}{
+				map[string]interface{}{
+					"key":      "node-role.kubernetes.io/control-plane",
+					"operator": "Exists",
+					"effect":   "NoSchedule",
+				},
+			}, "spec", "affinity", "tolerations")
+		}
+		return controllerutil.SetControllerReference(stack, cl, r.Scheme)
+	}); err != nil {
+		return false, "", fmt.Errorf("cnpg cluster %s: %w", name, err)
+	}
+
+	readyInstances, _, _ := unstructured.NestedInt64(cl.Object, "status", "readyInstances")
+	return readyInstances >= 1, name + "-app", nil
+}
+
+// postgresEnv binds a postgres connection: `as` gets the full connection URI, and
+// the discrete PG* vars are injected too (both sourced from the CNPG app Secret,
+// by reference, so credentials never land in the Deployment spec).
+func postgresEnv(secret, as string) []corev1.EnvVar {
+	ref := func(key string) *corev1.EnvVarSource {
+		return &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+			LocalObjectReference: corev1.LocalObjectReference{Name: secret}, Key: key,
+		}}
+	}
+	return []corev1.EnvVar{
+		{Name: as, ValueFrom: ref("uri")},
+		{Name: "PGHOST", ValueFrom: ref("host")},
+		{Name: "PGPORT", ValueFrom: ref("port")},
+		{Name: "PGDATABASE", ValueFrom: ref("dbname")},
+		{Name: "PGUSER", ValueFrom: ref("user")},
+		{Name: "PGPASSWORD", ValueFrom: ref("password")},
+	}
 }
 
 // reconcileReleaseJob ensures the per-generation release Job exists and reports
 // whether it is done/failed. A new generation re-runs the migration.
-func (r *StackReconciler) reconcileReleaseJob(ctx context.Context, stack *paasv1.Stack, svc *paasv1.ServiceSpec, image string, env []paasv1.EnvVar) (done, failed bool, err error) {
+func (r *StackReconciler) reconcileReleaseJob(ctx context.Context, stack *paasv1.Stack, svc *paasv1.ServiceSpec, image string, env []corev1.EnvVar) (done, failed bool, err error) {
 	name := fmt.Sprintf("%s-%s-release-g%d", stack.Name, svc.Name, stack.Generation)
 	var job batchv1.Job
 	err = r.Get(ctx, types.NamespacedName{Namespace: stack.Namespace, Name: name}, &job)
@@ -128,7 +255,7 @@ func (r *StackReconciler) reconcileReleaseJob(ctx context.Context, stack *paasv1
 	return false, false, nil
 }
 
-func (r *StackReconciler) buildReleaseJob(stack *paasv1.Stack, svc *paasv1.ServiceSpec, image, name string, env []paasv1.EnvVar) batchv1.Job {
+func (r *StackReconciler) buildReleaseJob(stack *paasv1.Stack, svc *paasv1.ServiceSpec, image, name string, env []corev1.EnvVar) batchv1.Job {
 	backoff := int32(2)
 	return batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -148,7 +275,7 @@ func (r *StackReconciler) buildReleaseJob(stack *paasv1.Stack, svc *paasv1.Servi
 						Image:           image,
 						ImagePullPolicy: corev1.PullIfNotPresent,
 						Command:         shCommand(svc.Hooks.Release),
-						Env:             plainEnv(env),
+						Env:             env,
 						SecurityContext: hardenedSecurityContext(),
 					}},
 				},
@@ -159,7 +286,7 @@ func (r *StackReconciler) buildReleaseJob(stack *paasv1.Stack, svc *paasv1.Servi
 
 // reconcileProcess creates/updates the Deployment (+ Service, if the process has
 // a port) for one process of a service.
-func (r *StackReconciler) reconcileProcess(ctx context.Context, stack *paasv1.Stack, svc *paasv1.ServiceSpec, p *paasv1.ProcessSpec, image string, baseEnv []paasv1.EnvVar) error {
+func (r *StackReconciler) reconcileProcess(ctx context.Context, stack *paasv1.Stack, svc *paasv1.ServiceSpec, p *paasv1.ProcessSpec, image string, svcEnv []corev1.EnvVar) error {
 	name := fmt.Sprintf("%s-%s-%s", stack.Name, svc.Name, p.Name)
 	labels := map[string]string{"paas.sh/stack": stack.Name, "paas.sh/service": svc.Name, "paas.sh/process": p.Name}
 	replicas := p.Replicas
@@ -179,7 +306,7 @@ func (r *StackReconciler) reconcileProcess(ctx context.Context, stack *paasv1.St
 			Name:            p.Name,
 			Image:           image,
 			ImagePullPolicy: corev1.PullIfNotPresent,
-			Env:             processEnv(baseEnv, p.Port),
+			Env:             processEnv(svcEnv, p.Port),
 			Resources:       resources(p.Resources),
 			SecurityContext: hardenedSecurityContext(),
 		}
@@ -210,7 +337,7 @@ func (r *StackReconciler) reconcileProcess(ctx context.Context, stack *paasv1.St
 	return nil
 }
 
-func (r *StackReconciler) updateStatus(ctx context.Context, stack *paasv1.Stack, releasePending, releaseFailed bool) (ctrl.Result, error) {
+func (r *StackReconciler) updateStatus(ctx context.Context, stack *paasv1.Stack, backingPending, releasePending, releaseFailed bool) (ctrl.Result, error) {
 	var deps appsv1.DeploymentList
 	if err := r.List(ctx, &deps, client.InNamespace(stack.Namespace), client.MatchingLabels{"paas.sh/stack": stack.Name}); err != nil {
 		return ctrl.Result{}, err
@@ -230,6 +357,8 @@ func (r *StackReconciler) updateStatus(ctx context.Context, stack *paasv1.Stack,
 	case releaseFailed:
 		stack.Status.ReleaseHook = "Failed"
 		stack.Status.Phase = "ReleaseFailed"
+	case backingPending:
+		stack.Status.Phase = "ProvisioningBacking"
 	case releasePending:
 		stack.Status.ReleaseHook = "Running"
 		stack.Status.Phase = "ReleaseHook"
@@ -247,6 +376,10 @@ func (r *StackReconciler) updateStatus(ctx context.Context, stack *paasv1.Stack,
 	}
 	if err := r.Status().Update(ctx, stack); err != nil {
 		return ctrl.Result{}, err
+	}
+	// Poll while backing is provisioning (CNPG Cluster is not Owns-watched).
+	if backingPending {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 	return ctrl.Result{}, nil
 }
@@ -284,7 +417,7 @@ func serviceURLs(stack *paasv1.Stack) map[string]string {
 			if p.Port > 0 {
 				name := fmt.Sprintf("%s-%s-%s", stack.Name, svc.Name, p.Name)
 				out[svc.Name] = fmt.Sprintf("http://%s.%s.svc.cluster.local", name, stack.Namespace)
-				break // first ported process is the service's entrypoint
+				break
 			}
 		}
 	}
@@ -309,17 +442,18 @@ func hardenedSecurityContext() *corev1.SecurityContext {
 	}
 }
 
-// processEnv is the container env for a running process: PORT (when it has one) +
-// the service/connection env.
-func processEnv(in []paasv1.EnvVar, port int32) []corev1.EnvVar {
-	var out []corev1.EnvVar
-	if port > 0 {
-		out = append(out, corev1.EnvVar{Name: "PORT", Value: fmt.Sprintf("%d", port)})
+// processEnv prepends PORT (when the process has one) to the service env.
+func processEnv(svcEnv []corev1.EnvVar, port int32) []corev1.EnvVar {
+	if port <= 0 {
+		return svcEnv
 	}
-	return append(out, plainEnv(in)...)
+	out := make([]corev1.EnvVar, 0, len(svcEnv)+1)
+	out = append(out, corev1.EnvVar{Name: "PORT", Value: fmt.Sprintf("%d", port)})
+	return append(out, svcEnv...)
 }
 
-func plainEnv(in []paasv1.EnvVar) []corev1.EnvVar {
+// envFromSpec converts the Stack's plain name/value env into container env.
+func envFromSpec(in []paasv1.EnvVar) []corev1.EnvVar {
 	out := make([]corev1.EnvVar, 0, len(in))
 	for _, e := range in {
 		out = append(out, corev1.EnvVar{Name: e.Name, Value: e.Value})
