@@ -38,12 +38,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	tolerate := os.Getenv("TENANT_SCHEDULE_ON_CONTROL_PLANE") != "false"
+
 	if err := (&controller.AppReconciler{
 		Client:               mgr.GetClient(),
 		Scheme:               mgr.GetScheme(),
-		TolerateControlPlane: os.Getenv("TENANT_SCHEDULE_ON_CONTROL_PLANE") != "false",
+		TolerateControlPlane: tolerate,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to set up App controller")
+		os.Exit(1)
+	}
+
+	if err := (&controller.StackReconciler{
+		Client:               mgr.GetClient(),
+		Scheme:               mgr.GetScheme(),
+		TolerateControlPlane: tolerate,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to set up Stack controller")
 		os.Exit(1)
 	}
 

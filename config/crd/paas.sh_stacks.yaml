@@ -1,0 +1,233 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: stacks.paas.sh
+spec:
+  group: paas.sh
+  names:
+    kind: Stack
+    listKind: StackList
+    plural: stacks
+    singular: stack
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.services
+      name: Services
+      type: integer
+    - jsonPath: .status.readyServices
+      name: Ready
+      type: integer
+    - jsonPath: .status.releaseHook
+      name: Release
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Stack is a multi-service application graph.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              StackSpec is a multi-service application graph: services (each built once and
+              run as one or more processes), the backing data services they need, and the
+              volumes and connections that wire them together. M5a reconciles the services
+              half (processes -> Deployments/Services, release hooks -> Jobs); backing
+              services and connection provisioning land in M5b.
+            properties:
+              backing:
+                description: |-
+                  Backing are the self-hosted data services (postgres, valkey, ...).
+                  Recorded now; provisioned by the catalog in M5b.
+                items:
+                  description: BackingSpec references a catalog data service (provisioned
+                    in M5b).
+                  properties:
+                    disk:
+                      type: string
+                    name:
+                      type: string
+                    plan:
+                      default: small
+                      type: string
+                    type:
+                      type: string
+                    version:
+                      type: string
+                  required:
+                  - name
+                  - type
+                  type: object
+                type: array
+              services:
+                description: Services are the application services built from the
+                  repo.
+                items:
+                  description: ServiceSpec is one buildable unit that runs as one
+                    or more processes.
+                  properties:
+                    build:
+                      description: Build describes how to produce the image from the
+                        repo (not yet wired).
+                      properties:
+                        dockerfile:
+                          type: string
+                        repoSubdir:
+                          type: string
+                      type: object
+                    connections:
+                      description: |-
+                        Connections are typed edges to other services or backing services.
+                        M5a resolves intra-stack service edges (injects an internal URL);
+                        backing-service edges are recorded for M5b.
+                      items:
+                        description: |-
+                          ConnectionSpec is a typed edge. `To` names a service or backing service in the
+                          stack; `As` is the env var the consumer expects the connection under.
+                        properties:
+                          as:
+                            type: string
+                          to:
+                            type: string
+                        required:
+                        - to
+                        type: object
+                      type: array
+                    env:
+                      description: Env is injected into every process of this service.
+                      items:
+                        description: EnvVar is a plain name/value environment variable
+                          for the app process.
+                        properties:
+                          name:
+                            type: string
+                          value:
+                            type: string
+                        required:
+                        - name
+                        type: object
+                      type: array
+                    hooks:
+                      description: Hooks.release runs to completion (as a Job) before
+                        the processes roll.
+                      properties:
+                        release:
+                          description: Release runs to completion before the new processes
+                            roll (migrations).
+                          type: string
+                      type: object
+                    image:
+                      description: |-
+                        Image is the OCI ref to run. M5a uses this directly; Build (repo -> image
+                        via the fleet) is wired in a later milestone.
+                      type: string
+                    name:
+                      type: string
+                    processes:
+                      description: Processes are the deployables from this one image
+                        (web, worker, cron).
+                      items:
+                        description: ProcessSpec is one deployable of a service.
+                        properties:
+                          command:
+                            description: Command is run via `sh -c`. Empty uses the
+                              image entrypoint.
+                            type: string
+                          kind:
+                            default: web
+                            description: Kind is web|worker|cron (informational for
+                              M5a; cron -> CronJob later).
+                            type: string
+                          name:
+                            type: string
+                          port:
+                            description: Port, if >0, exposes a Service and (later)
+                              an edge domain.
+                            format: int32
+                            type: integer
+                          replicas:
+                            default: 1
+                            format: int32
+                            type: integer
+                          resources:
+                            description: |-
+                              Resources is the per-replica limit. Requests are set low by the operator so
+                              the tenant pool can overcommit; these are the ceilings.
+                            properties:
+                              cpu:
+                                default: 500m
+                                type: string
+                              memory:
+                                default: 512Mi
+                                type: string
+                            type: object
+                        required:
+                        - name
+                        type: object
+                      type: array
+                  required:
+                  - name
+                  type: object
+                type: array
+              volumes:
+                description: Volumes are named storage claims (block|file|object).
+                  Recorded now.
+                items:
+                  description: VolumeSpec is a named storage claim.
+                  properties:
+                    kind:
+                      default: block
+                      type: string
+                    name:
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
+            type: object
+          status:
+            description: StackStatus is the observed state.
+            properties:
+              observedGeneration:
+                format: int64
+                type: integer
+              phase:
+                type: string
+              readyServices:
+                format: int32
+                type: integer
+              releaseHook:
+                description: ReleaseHook is the aggregate phase of release Jobs this
+                  generation.
+                type: string
+              services:
+                format: int32
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
