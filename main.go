@@ -57,6 +57,16 @@ func main() {
 	tier := controller.ResolveTier(os.Getenv("PAAS_OVERCOMMIT_TIER"))
 	schedulerName := os.Getenv("PAAS_SCHEDULER_NAME")
 
+	// S3 object-storage backing (Ceph RGW via Rook).
+	objectStorageClass := os.Getenv("PAAS_OBJECT_STORAGECLASS")
+	if objectStorageClass == "" {
+		objectStorageClass = "ceph-bucket"
+	}
+	objectEndpoint := os.Getenv("PAAS_OBJECT_ENDPOINT")
+	if objectEndpoint == "" {
+		objectEndpoint = "http://rook-ceph-rgw-paas-s3.rook-ceph.svc"
+	}
+
 	if err := (&controller.AppReconciler{
 		Client:               mgr.GetClient(),
 		Scheme:               mgr.GetScheme(),
@@ -76,6 +86,8 @@ func main() {
 		SystemNamespace:      systemNamespace,
 		Tier:                 tier,
 		SchedulerName:        schedulerName,
+		ObjectStorageClass:   objectStorageClass,
+		ObjectEndpoint:       objectEndpoint,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to set up Stack controller")
 		os.Exit(1)
