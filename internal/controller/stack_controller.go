@@ -89,6 +89,9 @@ type backing struct {
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=postgresql.cnpg.io,resources=clusters;scheduledbackups;backups,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=objectbucket.io,resources=objectbucketclaims,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshots;volumesnapshotcontents,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=snapscheduler.backube,resources=snapshotschedules,verbs=get;list;watch;create;update;patch;delete
 
 func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
@@ -210,24 +213,41 @@ func (r *StackReconciler) reconcileBacking(ctx context.Context, stack *paasv1.St
 			out[b.Name] = backing{ready: ready, env: func(as string) []corev1.EnvVar { return r.objectEnv(n, as) }}
 		default:
 			if def := catalog.lookup(b.Type); def != nil {
-				ready, secret, err := r.reconcileTemplated(ctx, stack, b, def)
+				ready, secret, tp, err := r.reconcileTemplated(ctx, stack, b, def)
 				if err != nil {
 					return nil, false, err
 				}
+				backupPending = backupPending || tp
 				d, s := def, secret
 				out[b.Name] = backing{ready: ready, env: func(as string) []corev1.EnvVar { return templatedEnv(d, s, as) }}
 				continue
 			}
 			if b.Image != "" {
-				ready, secret, err := r.reconcileFallback(ctx, stack, b)
+				ready, secret, fp, err := r.reconcileFallback(ctx, stack, b)
 				if err != nil {
 					return nil, false, err
 				}
+				backupPending = backupPending || fp
 				s := secret
 				out[b.Name] = backing{ready: ready, env: func(as string) []corev1.EnvVar { return fallbackEnv(s, as) }}
 				continue
 			}
 			l.Info("backing type not in catalog and no image for fallback (see backing-services catalog)", "name", b.Name, "type", b.Type)
+		}
+	}
+
+	// Backup schedule (M5c-3): if any non-preview backing opts into backups, stamp
+	// the per-stack snapscheduler SnapshotSchedule that snapshots the labelled PVCs
+	// (valkey/generic) daily and prunes to a retention count. postgres keeps its own
+	// barman WAL+base backup; object buckets are inherently durable. Best-effort.
+	if !isPreviewClone(stack) {
+		for i := range stack.Spec.Backing {
+			if stack.Spec.Backing[i].Backup {
+				if serr := r.ensureBackupSchedule(ctx, stack); serr != nil {
+					l.Error(serr, "ensure backup schedule")
+				}
+				break
+			}
 		}
 	}
 	return out, backupPending, nil
@@ -561,13 +581,13 @@ func (r *StackReconciler) objectEnv(name, as string) []corev1.EnvVar {
 // generated credentials and no managed features. A service earns those by graduating
 // to a TEMPLATE descriptor (servicedef.go) and then, if it needs HA/backups, to an
 // OPERATOR adapter.
-func (r *StackReconciler) reconcileFallback(ctx context.Context, stack *paasv1.Stack, b *paasv1.BackingSpec) (ready bool, secretName string, err error) {
+func (r *StackReconciler) reconcileFallback(ctx context.Context, stack *paasv1.Stack, b *paasv1.BackingSpec) (ready bool, secretName string, pending bool, err error) {
 	name := fmt.Sprintf("%s-%s", stack.Name, b.Name)
 	labels := map[string]string{"paas.sh/stack": stack.Name, "paas.sh/backing": b.Name}
 	host := fmt.Sprintf("%s.%s.svc.cluster.local", name, stack.Namespace)
 	port := b.Port
 	if port == 0 {
-		return false, "", fmt.Errorf("fallback backing %q needs a port", b.Name)
+		return false, "", false, fmt.Errorf("fallback backing %q needs a port", b.Name)
 	}
 
 	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: stack.Namespace}}
@@ -580,7 +600,7 @@ func (r *StackReconciler) reconcileFallback(ctx context.Context, stack *paasv1.S
 		sec.Data["endpoint"] = []byte(fmt.Sprintf("%s:%d", host, port))
 		return controllerutil.SetControllerReference(stack, sec, r.Scheme)
 	}); err != nil {
-		return false, "", fmt.Errorf("fallback secret: %w", err)
+		return false, "", false, fmt.Errorf("fallback secret: %w", err)
 	}
 
 	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: stack.Namespace}}
@@ -591,7 +611,7 @@ func (r *StackReconciler) reconcileFallback(ctx context.Context, stack *paasv1.S
 		svc.Spec.Ports = []corev1.ServicePort{{Name: "svc", Port: port, TargetPort: intstr.FromInt32(port)}}
 		return controllerutil.SetControllerReference(stack, svc, r.Scheme)
 	}); err != nil {
-		return false, "", fmt.Errorf("fallback service: %w", err)
+		return false, "", false, fmt.Errorf("fallback service: %w", err)
 	}
 
 	disk := b.Disk
@@ -599,15 +619,28 @@ func (r *StackReconciler) reconcileFallback(ctx context.Context, stack *paasv1.S
 		disk = "1Gi"
 	}
 	replicas := int32(1)
+
+	// Clone (M5c-3): a preview seeds a generic backing's PVC from the parent via CSI
+	// snapshot restore. Only on first creation (the dataSource is immutable);
+	// requeue until the restore snapshot is ReadyToUse.
+	var cloneDataSource *corev1.TypedLocalObjectReference
+	if isPreviewClone(stack) && !r.statefulSetExists(ctx, stack.Namespace, name) {
+		vs, vready, cerr := r.prepareCloneRestore(ctx, stack, b.Name)
+		if cerr != nil {
+			return false, "", false, cerr
+		}
+		if !vready {
+			return false, name, true, nil
+		}
+		cloneDataSource = snapshotDataSource(vs)
+	}
+
 	ss := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: stack.Namespace}}
 	if _, err = controllerutil.CreateOrUpdate(ctx, r.Client, ss, func() error {
 		ss.Labels = labels
 		ss.Spec.ServiceName = name
 		ss.Spec.Replicas = &replicas
 		ss.Spec.Selector = &metav1.LabelSelector{MatchLabels: labels}
-		ss.Spec.PersistentVolumeClaimRetentionPolicy = &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
-			WhenDeleted: appsv1.DeletePersistentVolumeClaimRetentionPolicyType,
-		}
 		ss.Spec.Template.ObjectMeta.Labels = labels
 		ss.Spec.Template.Spec.AutomountServiceAccountToken = ptr(false)
 		ss.Spec.Template.Spec.Tolerations = r.tolerations()
@@ -621,20 +654,36 @@ func (r *StackReconciler) reconcileFallback(ctx context.Context, stack *paasv1.S
 			VolumeMounts:    []corev1.VolumeMount{{Name: "data", MountPath: "/data"}},
 			SecurityContext: hardenedSecurityContext(),
 		}}
-		ss.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{{
-			ObjectMeta: metav1.ObjectMeta{Name: "data"},
-			Spec: corev1.PersistentVolumeClaimSpec{
-				AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
-				StorageClassName: ptr("ceph-block"),
-				Resources:        corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resourceQty(disk)}},
-			},
-		}}
+		// VolumeClaimTemplates are immutable after creation, so set them (and the
+		// clone dataSource) only on create (empty UID).
+		if ss.UID == "" {
+			ss.Spec.PersistentVolumeClaimRetentionPolicy = &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
+				WhenDeleted: appsv1.DeletePersistentVolumeClaimRetentionPolicyType,
+			}
+			ss.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{{
+				ObjectMeta: metav1.ObjectMeta{Name: "data"},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+					StorageClassName: ptr("ceph-block"),
+					DataSource:       cloneDataSource,
+					Resources:        corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resourceQty(disk)}},
+				},
+			}}
+		}
 		return controllerutil.SetControllerReference(stack, ss, r.Scheme)
 	}); err != nil {
-		return false, "", fmt.Errorf("fallback statefulset: %w", err)
+		return false, "", false, fmt.Errorf("fallback statefulset: %w", err)
 	}
 
-	return ss.Status.ReadyReplicas >= 1, name, nil
+	// Backup: a backed-up, non-preview generic backing gets its PVC labelled for the
+	// snapscheduler SnapshotSchedule (best-effort).
+	if b.Backup && !isPreviewClone(stack) {
+		if lerr := r.labelBackupPVC(ctx, stack, b.Name); lerr != nil {
+			log.FromContext(ctx).Error(lerr, "label backup pvc", "backing", b.Name)
+		}
+	}
+
+	return ss.Status.ReadyReplicas >= 1, name, false, nil
 }
 
 // fallbackEnv binds a fallback backing: the `as` env gets "host:port"; discrete

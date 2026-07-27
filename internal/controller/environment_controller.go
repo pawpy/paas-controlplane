@@ -48,6 +48,7 @@ type EnvironmentReconciler struct {
 // +kubebuilder:rbac:groups="",resources=limitranges,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=cilium.io,resources=ciliumnetworkpolicies,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshots;volumesnapshotcontents,verbs=get;list;watch;delete
 
 func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
@@ -63,6 +64,14 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// child of the (namespaced) Environment; the finalizer is how we GC it.
 	if !env.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(&env, envFinalizer) {
+			// GC the clone artifacts a preview created outside its namespace: the
+			// parent-namespace source snapshots and the cluster-scoped static
+			// VolumeSnapshotContents (labelled with this namespace). They cannot be
+			// owned across namespaces / at cluster scope, so the namespace delete
+			// does not collect them.
+			if err := gcCloneArtifacts(ctx, r.Client, ns); err != nil {
+				return ctrl.Result{}, fmt.Errorf("gc clone artifacts: %w", err)
+			}
 			if err := r.deleteNamespace(ctx, ns); err != nil {
 				return ctrl.Result{}, err
 			}

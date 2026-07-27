@@ -206,7 +206,7 @@ func (r *StackReconciler) catalog(ctx context.Context) *serviceCatalog {
 // reconcileTemplated provisions a template-backed service from its descriptor: a
 // generated-password Secret (holding host/port/url/...), a headless Service, and a
 // StatefulSet. It is the single interpreter for the whole template tier.
-func (r *StackReconciler) reconcileTemplated(ctx context.Context, stack *paasv1.Stack, b *paasv1.BackingSpec, def *ServiceDefinition) (ready bool, secretName string, err error) {
+func (r *StackReconciler) reconcileTemplated(ctx context.Context, stack *paasv1.Stack, b *paasv1.BackingSpec, def *ServiceDefinition) (ready bool, secretName string, pending bool, err error) {
 	name := fmt.Sprintf("%s-%s", stack.Name, b.Name)
 	labels := map[string]string{"paas.sh/stack": stack.Name, "paas.sh/backing": b.Name}
 	host := fmt.Sprintf("%s.%s.svc.cluster.local", name, stack.Namespace)
@@ -216,7 +216,7 @@ func (r *StackReconciler) reconcileTemplated(ctx context.Context, stack *paasv1.
 	version := orDefault(b.Version, def.DefaultVersion)
 	image, err := renderTemplate(def.Image, map[string]string{"Version": version})
 	if err != nil {
-		return false, "", fmt.Errorf("%s image template: %w", def.Type, err)
+		return false, "", false, fmt.Errorf("%s image template: %w", def.Type, err)
 	}
 
 	// 1) Secret: password minted once (if any), then host/port and the templated
@@ -243,7 +243,7 @@ func (r *StackReconciler) reconcileTemplated(ctx context.Context, stack *paasv1.
 		}
 		return controllerutil.SetControllerReference(stack, sec, r.Scheme)
 	}); err != nil {
-		return false, "", fmt.Errorf("%s secret: %w", def.Type, err)
+		return false, "", false, fmt.Errorf("%s secret: %w", def.Type, err)
 	}
 
 	// 2) Headless Service.
@@ -255,7 +255,7 @@ func (r *StackReconciler) reconcileTemplated(ctx context.Context, stack *paasv1.
 		svc.Spec.Ports = []corev1.ServicePort{{Name: portName, Port: port, TargetPort: intstr.FromInt32(port)}}
 		return controllerutil.SetControllerReference(stack, svc, r.Scheme)
 	}); err != nil {
-		return false, "", fmt.Errorf("%s service: %w", def.Type, err)
+		return false, "", false, fmt.Errorf("%s service: %w", def.Type, err)
 	}
 
 	// 3) StatefulSet.
@@ -277,6 +277,23 @@ func (r *StackReconciler) reconcileTemplated(ctx context.Context, stack *paasv1.
 		container.VolumeMounts = []corev1.VolumeMount{{Name: "data", MountPath: def.Persistence.MountPath}}
 	}
 
+	// Clone (M5c-3): a preview seeds a persistent (PVC-backed) template backing from
+	// the parent via CSI snapshot restore. Only on first creation (the PVC
+	// dataSource is immutable); until the restore snapshot is ReadyToUse, requeue
+	// without creating the StatefulSet. Stateless template backings (no persistence,
+	// e.g. memcached/nats) have nothing to clone and just come up fresh.
+	var cloneDataSource *corev1.TypedLocalObjectReference
+	if def.Persistence != nil && isPreviewClone(stack) && !r.statefulSetExists(ctx, stack.Namespace, name) {
+		vs, vready, cerr := r.prepareCloneRestore(ctx, stack, b.Name)
+		if cerr != nil {
+			return false, "", false, cerr
+		}
+		if !vready {
+			return false, name, true, nil
+		}
+		cloneDataSource = snapshotDataSource(vs)
+	}
+
 	ss := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: stack.Namespace}}
 	if _, err = controllerutil.CreateOrUpdate(ctx, r.Client, ss, func() error {
 		ss.Labels = labels
@@ -289,7 +306,9 @@ func (r *StackReconciler) reconcileTemplated(ctx context.Context, stack *paasv1.
 		applyScheduler(&ss.Spec.Template.Spec, r.SchedulerName)
 		ss.Spec.Template.Spec.SecurityContext = podSecurityContext(def.Security)
 		ss.Spec.Template.Spec.Containers = []corev1.Container{container}
-		if def.Persistence != nil {
+		// VolumeClaimTemplates are immutable after creation, so build them only on
+		// create (empty UID); the clone dataSource likewise applies once.
+		if def.Persistence != nil && ss.UID == "" {
 			disk := orDefault(b.Disk, orDefault(def.Persistence.DefaultDisk, "1Gi"))
 			ss.Spec.PersistentVolumeClaimRetentionPolicy = &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
 				WhenDeleted: appsv1.DeletePersistentVolumeClaimRetentionPolicyType,
@@ -299,16 +318,26 @@ func (r *StackReconciler) reconcileTemplated(ctx context.Context, stack *paasv1.
 				Spec: corev1.PersistentVolumeClaimSpec{
 					AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 					StorageClassName: ptr("ceph-block"),
+					DataSource:       cloneDataSource,
 					Resources:        corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resourceQty(disk)}},
 				},
 			}}
 		}
 		return controllerutil.SetControllerReference(stack, ss, r.Scheme)
 	}); err != nil {
-		return false, "", fmt.Errorf("%s statefulset: %w", def.Type, err)
+		return false, "", false, fmt.Errorf("%s statefulset: %w", def.Type, err)
 	}
 
-	return ss.Status.ReadyReplicas >= 1, name, nil
+	// Backup (M5c-3): a persistent, backed-up, non-preview backing gets its PVC
+	// labelled so the snapscheduler SnapshotSchedule snapshots it. Best-effort: a
+	// snapshot-infra hiccup must not fail app provisioning.
+	if def.Persistence != nil && b.Backup && !isPreviewClone(stack) {
+		if lerr := r.labelBackupPVC(ctx, stack, b.Name); lerr != nil {
+			log.FromContext(ctx).Error(lerr, "label backup pvc", "backing", b.Name)
+		}
+	}
+
+	return ss.Status.ReadyReplicas >= 1, name, false, nil
 }
 
 // templatedEnv binds a connection to a template-backed service: the `as` env gets
