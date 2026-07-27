@@ -45,6 +45,12 @@ type StackReconciler struct {
 	Builtins *serviceCatalog
 	// SystemNamespace is where the optional paas-servicedefs ConfigMap lives.
 	SystemNamespace string
+	// Tier is the overcommit pool for tenant workloads (dev/prod/build). Requests
+	// are derived from limits by its ratios. See overcommit.go.
+	Tier overcommit
+	// SchedulerName routes tenant pods to a named scheduler (Trimaran usage-aware
+	// bin-packer); empty uses the default kube-scheduler.
+	SchedulerName string
 }
 
 // backing is a provisioned data service: whether it is ready to serve, and how a
@@ -307,12 +313,13 @@ func (r *StackReconciler) reconcileFallback(ctx context.Context, stack *paasv1.S
 		ss.Spec.Template.ObjectMeta.Labels = labels
 		ss.Spec.Template.Spec.AutomountServiceAccountToken = ptr(false)
 		ss.Spec.Template.Spec.Tolerations = r.tolerations()
+		applyScheduler(&ss.Spec.Template.Spec, r.SchedulerName)
 		ss.Spec.Template.Spec.Containers = []corev1.Container{{
 			Name:            "backing",
 			Image:           normalizeImage(b.Image),
 			ImagePullPolicy: corev1.PullIfNotPresent,
 			Ports:           []corev1.ContainerPort{{ContainerPort: port, Name: "svc"}},
-			Resources:       fixedResources("500m", "512Mi"),
+			Resources:       fixedResources("500m", "512Mi", r.Tier),
 			VolumeMounts:    []corev1.VolumeMount{{Name: "data", MountPath: "/data"}},
 			SecurityContext: hardenedSecurityContext(),
 		}}
@@ -361,19 +368,10 @@ func randomPassword() string {
 
 func resourceQty(s string) resource.Quantity { return resource.MustParse(s) }
 
-// fixedResources is a small ceiling for template-backed backing services (low
-// requests so the tenant pool overcommits; limits are the ceiling).
-func fixedResources(cpuLimit, memLimit string) corev1.ResourceRequirements {
-	return corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("50m"),
-			corev1.ResourceMemory: resource.MustParse("64Mi"),
-		},
-		Limits: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse(cpuLimit),
-			corev1.ResourceMemory: resource.MustParse(memLimit),
-		},
-	}
+// fixedResources is the ceiling for a backing service; requests are tier-derived
+// (limit/overcommit) so the pool overcommits. See overcommit.go.
+func fixedResources(cpuLimit, memLimit string, t overcommit) corev1.ResourceRequirements {
+	return t.limitedResources(resource.MustParse(cpuLimit), resource.MustParse(memLimit))
 }
 
 // reconcileReleaseJob ensures the per-generation release Job exists and reports
@@ -424,6 +422,7 @@ func (r *StackReconciler) buildReleaseJob(stack *paasv1.Stack, svc *paasv1.Servi
 					RestartPolicy:                corev1.RestartPolicyNever,
 					AutomountServiceAccountToken: ptr(false),
 					Tolerations:                  r.tolerations(),
+					SchedulerName:                r.SchedulerName,
 					Containers: []corev1.Container{{
 						Name:            "release",
 						Image:           image,
@@ -456,12 +455,13 @@ func (r *StackReconciler) reconcileProcess(ctx context.Context, stack *paasv1.St
 		dep.Spec.Template.ObjectMeta.Labels = labels
 		dep.Spec.Template.Spec.AutomountServiceAccountToken = ptr(false)
 		dep.Spec.Template.Spec.Tolerations = r.tolerations()
+		applyScheduler(&dep.Spec.Template.Spec, r.SchedulerName)
 		c := corev1.Container{
 			Name:            p.Name,
 			Image:           image,
 			ImagePullPolicy: corev1.PullIfNotPresent,
 			Env:             processEnv(svcEnv, p.Port),
-			Resources:       resources(p.Resources),
+			Resources:       resources(p.Resources, r.Tier),
 			SecurityContext: hardenedSecurityContext(),
 		}
 		if p.Command != "" {

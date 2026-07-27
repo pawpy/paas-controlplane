@@ -270,7 +270,7 @@ func (r *StackReconciler) reconcileTemplated(ctx context.Context, stack *paasv1.
 		Args:            def.Args,
 		Env:             containerEnvFrom(def.ContainerEnv, name),
 		Ports:           []corev1.ContainerPort{{ContainerPort: port, Name: portName}},
-		Resources:       fixedResources(cpuLimit, memLimit),
+		Resources:       fixedResources(cpuLimit, memLimit, r.Tier),
 		SecurityContext: hardenedSecurityContext(),
 	}
 	if def.Persistence != nil {
@@ -286,6 +286,7 @@ func (r *StackReconciler) reconcileTemplated(ctx context.Context, stack *paasv1.
 		ss.Spec.Template.ObjectMeta.Labels = labels
 		ss.Spec.Template.Spec.AutomountServiceAccountToken = ptr(false)
 		ss.Spec.Template.Spec.Tolerations = r.tolerations()
+		applyScheduler(&ss.Spec.Template.Spec, r.SchedulerName)
 		ss.Spec.Template.Spec.SecurityContext = podSecurityContext(def.Security)
 		ss.Spec.Template.Spec.Containers = []corev1.Container{container}
 		if def.Persistence != nil {

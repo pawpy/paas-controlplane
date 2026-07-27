@@ -36,6 +36,12 @@ type AppReconciler struct {
 	// pods so they can run on a single converged box. Set false once dedicated
 	// tenant/worker nodes exist (tenants should not land on control-plane then).
 	TolerateControlPlane bool
+	// Tier is the overcommit pool for tenant workloads (dev/prod/build). Requests
+	// are derived from limits by its ratios. See overcommit.go.
+	Tier overcommit
+	// SchedulerName routes tenant pods to a named scheduler (Trimaran usage-aware
+	// bin-packer); empty uses the default kube-scheduler.
+	SchedulerName string
 }
 
 // +kubebuilder:rbac:groups=paas.sh,resources=apps;releases,verbs=get;list;watch;create;update;patch;delete
@@ -94,13 +100,14 @@ func (r *AppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 				Effect:   corev1.TaintEffectNoSchedule,
 			}}
 		}
+		applyScheduler(&dep.Spec.Template.Spec, r.SchedulerName)
 		dep.Spec.Template.Spec.Containers = []corev1.Container{{
 			Name:            "app",
 			Image:           image,
 			ImagePullPolicy: corev1.PullIfNotPresent,
 			Ports:           []corev1.ContainerPort{{ContainerPort: port, Name: "http"}},
 			Env:             toEnv(app.Spec.Env, port),
-			Resources:       resources(app.Spec.Resources),
+			Resources:       resources(app.Spec.Resources, r.Tier),
 			SecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: ptr(false),
 				Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
@@ -177,7 +184,10 @@ func toEnv(in []paasv1.EnvVar, port int32) []corev1.EnvVar {
 	return out
 }
 
-func resources(rr paasv1.Resources) corev1.ResourceRequirements {
+// resources builds the container resources for a tenant workload: the spec's
+// limits as the ceiling, and tier-derived requests (limit/overcommit) so the pool
+// overcommits (dev 15x CPU, 2x mem). See overcommit.go.
+func resources(rr paasv1.Resources, t overcommit) corev1.ResourceRequirements {
 	cpu := rr.CPU
 	if cpu == "" {
 		cpu = "500m"
@@ -186,17 +196,7 @@ func resources(rr paasv1.Resources) corev1.ResourceRequirements {
 	if mem == "" {
 		mem = "512Mi"
 	}
-	// Low requests => the tenant pool overcommits; limits are the ceiling.
-	return corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("10m"),
-			corev1.ResourceMemory: resource.MustParse("32Mi"),
-		},
-		Limits: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse(cpu),
-			corev1.ResourceMemory: resource.MustParse(mem),
-		},
-	}
+	return t.limitedResources(resource.MustParse(cpu), resource.MustParse(mem))
 }
 
 func ptr[T any](v T) *T { return &v }

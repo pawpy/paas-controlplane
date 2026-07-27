@@ -52,10 +52,17 @@ func main() {
 		systemNamespace = "paas-system"
 	}
 
+	// Overcommit pool for tenant workloads (this box = dev, 15x CPU / 2x mem) and
+	// the scheduler tenant pods opt into (Trimaran usage-aware bin-packer).
+	tier := controller.ResolveTier(os.Getenv("PAAS_OVERCOMMIT_TIER"))
+	schedulerName := os.Getenv("PAAS_SCHEDULER_NAME")
+
 	if err := (&controller.AppReconciler{
 		Client:               mgr.GetClient(),
 		Scheme:               mgr.GetScheme(),
 		TolerateControlPlane: tolerate,
+		Tier:                 tier,
+		SchedulerName:        schedulerName,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to set up App controller")
 		os.Exit(1)
@@ -67,6 +74,8 @@ func main() {
 		TolerateControlPlane: tolerate,
 		Builtins:             builtins,
 		SystemNamespace:      systemNamespace,
+		Tier:                 tier,
+		SchedulerName:        schedulerName,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to set up Stack controller")
 		os.Exit(1)
