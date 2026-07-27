@@ -99,7 +99,7 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 
 	// 1) Provision backing services and learn how to bind connections to them.
-	backings, err := r.reconcileBacking(ctx, &stack)
+	backings, backupPending, err := r.reconcileBacking(ctx, &stack)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -169,7 +169,7 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		}
 	}
 
-	return r.updateStatus(ctx, &stack, backingPending, releasePending, releaseFailed)
+	return r.updateStatus(ctx, &stack, backingPending, releasePending, releaseFailed, backupPending)
 }
 
 // reconcileBacking ensures each backing service exists and reports readiness +
@@ -180,24 +180,31 @@ func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 //     Adding one is a descriptor, not code (see servicedef.go).
 //   - FALLBACK: an uncataloged type with a user-supplied image runs as a bare
 //     StatefulSet so the long tail still works, without managed features.
-func (r *StackReconciler) reconcileBacking(ctx context.Context, stack *paasv1.Stack) (map[string]backing, error) {
+// reconcileBacking also reports backupPending: a backing that has asked for
+// backups but whose object-storage bucket has not bound yet. The controller does
+// not watch the OBC/CNPG Cluster, so without a requeue the barman wiring (set only
+// once the bucket is Bound) would never land after the first pass. The caller
+// requeues while this is true.
+func (r *StackReconciler) reconcileBacking(ctx context.Context, stack *paasv1.Stack) (map[string]backing, bool, error) {
 	l := log.FromContext(ctx)
 	catalog := r.catalog(ctx)
 	out := map[string]backing{}
+	backupPending := false
 	for i := range stack.Spec.Backing {
 		b := &stack.Spec.Backing[i]
 		switch {
 		case strings.EqualFold(b.Type, "postgres") || strings.EqualFold(b.Type, "postgresql"):
-			ready, secret, err := r.reconcilePostgres(ctx, stack, b)
+			ready, secret, bp, err := r.reconcilePostgres(ctx, stack, b)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
+			backupPending = backupPending || bp
 			s := secret
 			out[b.Name] = backing{ready: ready, env: func(as string) []corev1.EnvVar { return postgresEnv(s, as) }}
 		case strings.EqualFold(b.Type, "object") || strings.EqualFold(b.Type, "s3"):
 			ready, name, err := r.reconcileObject(ctx, stack, b)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			n := name
 			out[b.Name] = backing{ready: ready, env: func(as string) []corev1.EnvVar { return r.objectEnv(n, as) }}
@@ -205,7 +212,7 @@ func (r *StackReconciler) reconcileBacking(ctx context.Context, stack *paasv1.St
 			if def := catalog.lookup(b.Type); def != nil {
 				ready, secret, err := r.reconcileTemplated(ctx, stack, b, def)
 				if err != nil {
-					return nil, err
+					return nil, false, err
 				}
 				d, s := def, secret
 				out[b.Name] = backing{ready: ready, env: func(as string) []corev1.EnvVar { return templatedEnv(d, s, as) }}
@@ -214,7 +221,7 @@ func (r *StackReconciler) reconcileBacking(ctx context.Context, stack *paasv1.St
 			if b.Image != "" {
 				ready, secret, err := r.reconcileFallback(ctx, stack, b)
 				if err != nil {
-					return nil, err
+					return nil, false, err
 				}
 				s := secret
 				out[b.Name] = backing{ready: ready, env: func(as string) []corev1.EnvVar { return fallbackEnv(s, as) }}
@@ -223,7 +230,7 @@ func (r *StackReconciler) reconcileBacking(ctx context.Context, stack *paasv1.St
 			l.Info("backing type not in catalog and no image for fallback (see backing-services catalog)", "name", b.Name, "type", b.Type)
 		}
 	}
-	return out, nil
+	return out, backupPending, nil
 }
 
 // reconcilePostgres ensures a CloudNativePG Cluster for a postgres backing and
@@ -232,7 +239,7 @@ func (r *StackReconciler) reconcileBacking(ctx context.Context, stack *paasv1.St
 // also provisions a dedicated object-storage bucket and wires continuous WAL +
 // scheduled base backups to it (barman-cloud, in-tree in CNPG 1.30) — the same
 // backup that a PR-preview environment clones from (M5c).
-func (r *StackReconciler) reconcilePostgres(ctx context.Context, stack *paasv1.Stack, b *paasv1.BackingSpec) (ready bool, secretName string, err error) {
+func (r *StackReconciler) reconcilePostgres(ctx context.Context, stack *paasv1.Stack, b *paasv1.BackingSpec) (ready bool, secretName string, backupPending bool, err error) {
 	name := fmt.Sprintf("%s-%s", stack.Name, b.Name)
 	disk := b.Disk
 	if disk == "" {
@@ -252,7 +259,7 @@ func (r *StackReconciler) reconcilePostgres(ctx context.Context, stack *paasv1.S
 		var berr error
 		backupReady, backupBucket, berr = r.ensureBucket(ctx, stack, name+"-backup")
 		if berr != nil {
-			return false, "", berr
+			return false, "", false, berr
 		}
 	}
 
@@ -298,19 +305,21 @@ func (r *StackReconciler) reconcilePostgres(ctx context.Context, stack *paasv1.S
 		}
 		return controllerutil.SetControllerReference(stack, cl, r.Scheme)
 	}); err != nil {
-		return false, "", fmt.Errorf("cnpg cluster %s: %w", name, err)
+		return false, "", false, fmt.Errorf("cnpg cluster %s: %w", name, err)
 	}
 
 	// A ScheduledBackup (immediate + daily) gives a base backup to archive against
 	// and to clone previews from. Only once the bucket is wired.
 	if backupReady {
 		if err = r.ensureScheduledBackup(ctx, stack, name); err != nil {
-			return false, "", err
+			return false, "", false, err
 		}
 	}
 
 	readyInstances, _, _ := unstructured.NestedInt64(cl.Object, "status", "readyInstances")
-	return readyInstances >= 1, name + "-app", nil
+	// backupPending: backups were requested but the bucket has not bound yet, so
+	// barman is not wired. Requeue until it binds (nothing else re-triggers us).
+	return readyInstances >= 1, name + "-app", b.Backup && !backupReady, nil
 }
 
 // ensureScheduledBackup drives a daily base backup for a CNPG cluster (immediate:
@@ -653,7 +662,7 @@ func (r *StackReconciler) reconcileProcess(ctx context.Context, stack *paasv1.St
 	return nil
 }
 
-func (r *StackReconciler) updateStatus(ctx context.Context, stack *paasv1.Stack, backingPending, releasePending, releaseFailed bool) (ctrl.Result, error) {
+func (r *StackReconciler) updateStatus(ctx context.Context, stack *paasv1.Stack, backingPending, releasePending, releaseFailed, backupPending bool) (ctrl.Result, error) {
 	var deps appsv1.DeploymentList
 	if err := r.List(ctx, &deps, client.InNamespace(stack.Namespace), client.MatchingLabels{"paas.sh/stack": stack.Name}); err != nil {
 		return ctrl.Result{}, err
@@ -693,8 +702,10 @@ func (r *StackReconciler) updateStatus(ctx context.Context, stack *paasv1.Stack,
 	if err := r.Status().Update(ctx, stack); err != nil {
 		return ctrl.Result{}, err
 	}
-	// Poll while backing is provisioning (CNPG Cluster is not Owns-watched).
-	if backingPending {
+	// Poll while backing is provisioning, or while a backup bucket is still binding
+	// (neither the CNPG Cluster nor the OBC is Owns-watched, so nothing else wakes
+	// us to finish wiring barman once the bucket is Bound).
+	if backingPending || backupPending {
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 	return ctrl.Result{}, nil

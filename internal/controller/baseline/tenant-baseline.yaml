@@ -86,7 +86,11 @@ spec:
               - 169.254.0.0/16
 ---
 # 6) Egress to the platform S3 endpoint (Ceph RGW, a 10.x ClusterIP the internet
-# rule excludes). Needed by `object` backings and by CNPG WAL archiving.
+# rule excludes). Needed by `object` backings and by CNPG WAL + base backups.
+# The RGW Service is port 80 but targetPort 8080; Cilium enforces egress policy
+# AFTER service translation (on the backend port), so we must allow 8080 (the
+# translated port) as well as 80 (the service port, for CNIs that enforce pre-DNAT
+# and for portability). Allowing only 80 makes the connection silently time out.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -102,6 +106,7 @@ spec:
               kubernetes.io/metadata.name: rook-ceph
       ports:
         - { port: 80, protocol: TCP }
+        - { port: 8080, protocol: TCP }
 ---
 # 7) Ingress from backing-service operator namespaces (CNPG scrapes instance
 # status/metrics). Scoped to operator namespaces, not all platform namespaces.
