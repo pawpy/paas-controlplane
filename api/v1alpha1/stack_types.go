@@ -73,7 +73,9 @@ type ConnectionSpec struct {
 	As string `json:"as,omitempty"`
 }
 
-// BackingSpec references a catalog data service (provisioned in M5b).
+// BackingSpec references a catalog data service. `Type` selects the catalog tier:
+// an operator adapter (postgres), a template descriptor (valkey, memcached, ...),
+// or, for an uncataloged type, the generic fallback (requires Image + Port).
 type BackingSpec struct {
 	Name    string `json:"name"`
 	Type    string `json:"type"`
@@ -81,6 +83,11 @@ type BackingSpec struct {
 	Disk    string `json:"disk,omitempty"`
 	// +kubebuilder:default=small
 	Plan string `json:"plan,omitempty"`
+	// Image is the OCI ref for the generic FALLBACK path (uncataloged type). Ignored
+	// for operator- and template-backed types, which pick their own image.
+	Image string `json:"image,omitempty"`
+	// Port is the server port for the FALLBACK path. Required when Image is set.
+	Port int32 `json:"port,omitempty"`
 }
 
 // VolumeSpec is a named storage claim.

@@ -1,0 +1,23 @@
+# Memcached. Pure in-memory cache: no password, no persistence. Added as data only,
+# proving a new template service is a descriptor with zero Go.
+type: memcached
+image: "memcached:{{.Version}}-alpine"
+defaultVersion: "1.6"
+port: 11211
+portName: memcached
+# Run as the image's memcache user (11211) so the entrypoint skips its su-exec
+# privilege drop, which drop-ALL-caps blocks (same class of issue as valkey's chown).
+security:
+  runAsUser: 11211
+  runAsGroup: 11211
+  runAsNonRoot: true
+resources:
+  cpuLimit: 200m
+  memoryLimit: 256Mi
+secretValues:
+  servers: "{{.Host}}:{{.Port}}"
+binding:
+  primaryKey: servers
+  extra:
+    MEMCACHED_HOST: host
+    MEMCACHED_PORT: port

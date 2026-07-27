@@ -1,0 +1,38 @@
+# Valkey (BSD Redis fork). Template-tier: no operator, a single-node cache/queue
+# does not need one. This descriptor is the whole adapter; there is no Go for it.
+type: valkey
+aliases: [redis]
+image: "valkey/valkey:{{.Version}}-alpine"
+defaultVersion: "8"
+port: 6379
+portName: redis
+# The image entrypoint prepends valkey-server to leading-dash args; $(VALKEY_PASSWORD)
+# is expanded by the kubelet from containerEnv below.
+args: ["--requirepass", "$(VALKEY_PASSWORD)", "--appendonly", "yes"]
+generatePassword: true
+containerEnv:
+  VALKEY_PASSWORD: password
+# Sidekiq/Celery use Redis as a durable queue, so persist AOF.
+persistence:
+  mountPath: /data
+  defaultDisk: 1Gi
+# Run as the image's valkey user (999/1000) so the entrypoint skips its root-only
+# chown, which drop-ALL-caps blocks; fsGroup makes the Ceph volume group-writable.
+security:
+  runAsUser: 999
+  runAsGroup: 1000
+  fsGroup: 1000
+  runAsNonRoot: true
+resources:
+  cpuLimit: 100m
+  memoryLimit: 256Mi
+secretValues:
+  # Username "default" is required: valkey-cli -u treats an empty userinfo user as
+  # an ACL username and sends AUTH ""<pw>, which requirepass rejects.
+  url: "redis://default:{{.Password}}@{{.Host}}:{{.Port}}/0"
+binding:
+  primaryKey: url
+  extra:
+    REDIS_HOST: host
+    REDIS_PORT: port
+    REDIS_PASSWORD: password

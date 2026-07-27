@@ -1,0 +1,17 @@
+# NATS (core, non-clustered). Lightweight messaging; the single-node server needs
+# no operator. JetStream/clustering would push this to an operator adapter.
+type: nats
+image: "nats:{{.Version}}-alpine"
+defaultVersion: "2.10"
+port: 4222
+portName: nats
+resources:
+  cpuLimit: 200m
+  memoryLimit: 256Mi
+secretValues:
+  url: "nats://{{.Host}}:{{.Port}}"
+binding:
+  primaryKey: url
+  extra:
+    NATS_HOST: host
+    NATS_PORT: port

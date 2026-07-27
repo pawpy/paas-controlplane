@@ -40,6 +40,18 @@ func main() {
 
 	tolerate := os.Getenv("TENANT_SCHEDULE_ON_CONTROL_PLANE") != "false"
 
+	// The template-tier catalog (servicedef.go): compiled-in descriptors, later
+	// overlaid at reconcile time by the optional paas-servicedefs ConfigMap.
+	builtins, err := controller.LoadBuiltinCatalog()
+	if err != nil {
+		setupLog.Error(err, "unable to load builtin service catalog")
+		os.Exit(1)
+	}
+	systemNamespace := os.Getenv("PAAS_SYSTEM_NAMESPACE")
+	if systemNamespace == "" {
+		systemNamespace = "paas-system"
+	}
+
 	if err := (&controller.AppReconciler{
 		Client:               mgr.GetClient(),
 		Scheme:               mgr.GetScheme(),
@@ -53,6 +65,8 @@ func main() {
 		Client:               mgr.GetClient(),
 		Scheme:               mgr.GetScheme(),
 		TolerateControlPlane: tolerate,
+		Builtins:             builtins,
+		SystemNamespace:      systemNamespace,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to set up Stack controller")
 		os.Exit(1)

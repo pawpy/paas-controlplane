@@ -62,16 +62,28 @@ spec:
                   Backing are the self-hosted data services (postgres, valkey, ...).
                   Recorded now; provisioned by the catalog in M5b.
                 items:
-                  description: BackingSpec references a catalog data service (provisioned
-                    in M5b).
+                  description: |-
+                    BackingSpec references a catalog data service. `Type` selects the catalog tier:
+                    an operator adapter (postgres), a template descriptor (valkey, memcached, ...),
+                    or, for an uncataloged type, the generic fallback (requires Image + Port).
                   properties:
                     disk:
+                      type: string
+                    image:
+                      description: |-
+                        Image is the OCI ref for the generic FALLBACK path (uncataloged type). Ignored
+                        for operator- and template-backed types, which pick their own image.
                       type: string
                     name:
                       type: string
                     plan:
                       default: small
                       type: string
+                    port:
+                      description: Port is the server port for the FALLBACK path. Required
+                        when Image is set.
+                      format: int32
+                      type: integer
                     type:
                       type: string
                     version:
