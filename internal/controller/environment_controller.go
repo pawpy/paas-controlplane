@@ -159,6 +159,18 @@ func (r *EnvironmentReconciler) ensureStack(ctx context.Context, env *paasv1.Env
 		}
 		st.Labels["paas.sh/project"] = env.Spec.Project
 		st.Labels["paas.sh/environment"] = env.Name
+		// Clone (M5c-2): a preview seeds its stateful backings from a sibling
+		// environment's data. Record the parent coordinates as annotations; the
+		// Stack controller uses them to bootstrap postgres via CNPG recovery from
+		// the parent's barman backup. Non-postgres backings start fresh.
+		if env.Spec.Type == "preview" && env.Spec.CloneFrom != "" {
+			if st.Annotations == nil {
+				st.Annotations = map[string]string{}
+			}
+			st.Annotations["paas.sh/clone-from-stack"] = env.Spec.CloneFrom
+			st.Annotations["paas.sh/clone-from-namespace"] =
+				fmt.Sprintf("proj-%s-%s", env.Spec.Project, env.Spec.CloneFrom)
+		}
 		st.Spec = *env.Spec.Stack
 		return nil
 	})

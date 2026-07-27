@@ -240,6 +240,7 @@ func (r *StackReconciler) reconcileBacking(ctx context.Context, stack *paasv1.St
 // scheduled base backups to it (barman-cloud, in-tree in CNPG 1.30) — the same
 // backup that a PR-preview environment clones from (M5c).
 func (r *StackReconciler) reconcilePostgres(ctx context.Context, stack *paasv1.Stack, b *paasv1.BackingSpec) (ready bool, secretName string, backupPending bool, err error) {
+	l := log.FromContext(ctx)
 	name := fmt.Sprintf("%s-%s", stack.Name, b.Name)
 	disk := b.Disk
 	if disk == "" {
@@ -250,12 +251,50 @@ func (r *StackReconciler) reconcilePostgres(ctx context.Context, stack *paasv1.S
 		version = pgDefaultVersion
 	}
 
-	// Backups: provision a bucket first. WAL archiving needs its creds Secret to
-	// exist before the cluster references it, so hold off wiring barmanObjectStore
-	// until the OBC is Bound (its Secret + ConfigMap are then present). The cluster
-	// still comes up in the meantime; backups activate once the bucket binds.
+	// Clone (M5c-2): a preview environment seeds this postgres from a parent
+	// environment's barman backup via CNPG bootstrap.recovery. The Environment
+	// controller stamps the parent coordinates as annotations on the Stack. Only a
+	// backed-up parent can be cloned (recovery needs a base backup + WAL).
+	parentNs, parentCluster, isClone := cloneSource(stack, b)
+
+	// Bootstrap (initdb vs recovery) is honoured only at creation and is immutable
+	// afterward, so decide it once. A pre-Get tells us whether this is the first
+	// creation; inside the mutate the empty UID is the authoritative signal.
+	clExisting := &unstructured.Unstructured{}
+	clExisting.SetGroupVersionKind(cnpgClusterGVK)
+	clusterExists := r.Get(ctx, types.NamespacedName{Namespace: stack.Namespace, Name: name}, clExisting) == nil
+
+	// Before first creation of a clone, wait until the parent has a recoverable
+	// base backup, then copy its read creds into this namespace. Requeue (via
+	// backupPending) until then so the clone actually seeds rather than racing to
+	// an empty database.
+	cloneBucket, cloneCreds := "", ""
+	if isClone && !clusterExists {
+		recoverable, bucket, gerr := r.parentRecoverable(ctx, parentNs, parentCluster)
+		if gerr != nil {
+			return false, "", false, gerr
+		}
+		if !recoverable {
+			l.Info("clone source not yet recoverable, requeuing",
+				"cluster", name, "parent", parentNs+"/"+parentCluster)
+			return false, name + "-app", true, nil
+		}
+		cloneCreds = name + "-clone-src"
+		if err = r.copyBackupCreds(ctx, stack, parentNs, parentCluster+"-backup", cloneCreds); err != nil {
+			return false, "", false, fmt.Errorf("copy clone creds: %w", err)
+		}
+		cloneBucket = bucket
+	}
+
+	// Own backups: a persistent backed-up postgres gets its own bucket + WAL +
+	// scheduled base backup (the clone source for previews). A preview clone is
+	// ephemeral: it does not archive, it only reads the parent bucket.
 	backupBucket, backupReady := "", false
-	if b.Backup {
+	wantOwnBackup := b.Backup && !isClone
+	if wantOwnBackup {
+		// WAL archiving needs its creds Secret to exist before the cluster
+		// references it, so hold off wiring barmanObjectStore until the OBC is
+		// Bound (Secret + ConfigMap present). The cluster comes up meanwhile.
 		var berr error
 		backupReady, backupBucket, berr = r.ensureBucket(ctx, stack, name+"-backup")
 		if berr != nil {
@@ -273,9 +312,38 @@ func (r *StackReconciler) reconcilePostgres(ctx context.Context, stack *paasv1.S
 		_ = unstructured.SetNestedField(cl.Object, int64(1), "spec", "instances")
 		_ = unstructured.SetNestedField(cl.Object, disk, "spec", "storage", "size")
 		_ = unstructured.SetNestedField(cl.Object, "ceph-block", "spec", "storage", "storageClass")
-		_ = unstructured.SetNestedField(cl.Object, "app", "spec", "bootstrap", "initdb", "database")
-		_ = unstructured.SetNestedField(cl.Object, "app", "spec", "bootstrap", "initdb", "owner")
 		_ = unstructured.SetNestedField(cl.Object, pgImageRepo+":"+version, "spec", "imageName")
+
+		// Bootstrap is immutable after creation, so set it only on first create
+		// (empty UID). Clone -> physical recovery from the parent's external barman
+		// store; otherwise a fresh initdb database.
+		if cl.GetUID() == "" {
+			if isClone && cloneBucket != "" {
+				_ = unstructured.SetNestedField(cl.Object, parentCluster, "spec", "bootstrap", "recovery", "source")
+				_ = unstructured.SetNestedSlice(cl.Object, []interface{}{
+					map[string]interface{}{
+						"name": parentCluster,
+						"barmanObjectStore": map[string]interface{}{
+							"destinationPath": "s3://" + cloneBucket,
+							"endpointURL":     r.ObjectEndpoint,
+							// serverName is the barman folder the parent wrote under
+							// (defaults to the parent cluster name); must match or
+							// recovery finds no backup.
+							"serverName": parentCluster,
+							"s3Credentials": map[string]interface{}{
+								"accessKeyId":     map[string]interface{}{"name": cloneCreds, "key": "AWS_ACCESS_KEY_ID"},
+								"secretAccessKey": map[string]interface{}{"name": cloneCreds, "key": "AWS_SECRET_ACCESS_KEY"},
+							},
+							"wal": map[string]interface{}{"compression": "gzip"},
+						},
+					},
+				}, "spec", "externalClusters")
+			} else {
+				_ = unstructured.SetNestedField(cl.Object, "app", "spec", "bootstrap", "initdb", "database")
+				_ = unstructured.SetNestedField(cl.Object, "app", "spec", "bootstrap", "initdb", "owner")
+			}
+		}
+
 		if backupReady {
 			_ = unstructured.SetNestedMap(cl.Object, map[string]interface{}{
 				"destinationPath": "s3://" + backupBucket,
@@ -317,9 +385,68 @@ func (r *StackReconciler) reconcilePostgres(ctx context.Context, stack *paasv1.S
 	}
 
 	readyInstances, _, _ := unstructured.NestedInt64(cl.Object, "status", "readyInstances")
-	// backupPending: backups were requested but the bucket has not bound yet, so
-	// barman is not wired. Requeue until it binds (nothing else re-triggers us).
-	return readyInstances >= 1, name + "-app", b.Backup && !backupReady, nil
+	// backupPending: own backups were requested but the bucket has not bound yet,
+	// so barman is not wired. Requeue until it binds (nothing else re-triggers us).
+	return readyInstances >= 1, name + "-app", wantOwnBackup && !backupReady, nil
+}
+
+// cloneSource reads the clone coordinates the Environment controller stamps on a
+// preview's Stack. Clone applies only to postgres backings that opt into backups
+// (recovery needs a parent base backup + WAL). Returns the parent namespace and
+// the parent cluster name for this backing (parentStack-<backing>).
+func cloneSource(stack *paasv1.Stack, b *paasv1.BackingSpec) (parentNs, parentCluster string, ok bool) {
+	if !b.Backup {
+		return "", "", false
+	}
+	ns := stack.Annotations["paas.sh/clone-from-namespace"]
+	parentStack := stack.Annotations["paas.sh/clone-from-stack"]
+	if ns == "" || parentStack == "" {
+		return "", "", false
+	}
+	return ns, fmt.Sprintf("%s-%s", parentStack, b.Name), true
+}
+
+// parentRecoverable reports whether the parent CNPG cluster has a base backup that
+// can seed a clone, and returns the parent backup bucket name. Recoverability is
+// signalled by status.firstRecoverabilityPoint (set once a PITR-usable base backup
+// + WAL exist); the bucket name comes from the OBC-generated ConfigMap. A missing
+// parent cluster/ConfigMap is "not yet recoverable" (requeue), not an error.
+func (r *StackReconciler) parentRecoverable(ctx context.Context, ns, cluster string) (recoverable bool, bucket string, err error) {
+	pc := &unstructured.Unstructured{}
+	pc.SetGroupVersionKind(cnpgClusterGVK)
+	if e := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: cluster}, pc); e != nil {
+		return false, "", client.IgnoreNotFound(e)
+	}
+	frp, _, _ := unstructured.NestedString(pc.Object, "status", "firstRecoverabilityPoint")
+	byMethod, _, _ := unstructured.NestedMap(pc.Object, "status", "firstRecoverabilityPointByMethod")
+	if frp == "" && len(byMethod) == 0 {
+		return false, "", nil
+	}
+	var cm corev1.ConfigMap
+	if e := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: cluster + "-backup"}, &cm); e != nil {
+		return false, "", client.IgnoreNotFound(e)
+	}
+	return cm.Data["BUCKET_NAME"] != "", cm.Data["BUCKET_NAME"], nil
+}
+
+// copyBackupCreds mirrors the parent's backup-creds Secret (the OBC-generated
+// AWS_* keys) into this Stack's namespace so a clone can read the parent bucket.
+// Owned by the Stack, so it is GC'd with the preview namespace at teardown.
+func (r *StackReconciler) copyBackupCreds(ctx context.Context, stack *paasv1.Stack, srcNs, srcName, dstName string) error {
+	var src corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: srcNs, Name: srcName}, &src); err != nil {
+		return err
+	}
+	dst := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: dstName, Namespace: stack.Namespace}}
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, dst, func() error {
+		if dst.Data == nil {
+			dst.Data = map[string][]byte{}
+		}
+		dst.Data["AWS_ACCESS_KEY_ID"] = src.Data["AWS_ACCESS_KEY_ID"]
+		dst.Data["AWS_SECRET_ACCESS_KEY"] = src.Data["AWS_SECRET_ACCESS_KEY"]
+		return controllerutil.SetControllerReference(stack, dst, r.Scheme)
+	})
+	return err
 }
 
 // ensureScheduledBackup drives a daily base backup for a CNPG cluster (immediate:
