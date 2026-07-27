@@ -2,7 +2,7 @@
 # does not need one. This descriptor is the whole adapter; there is no Go for it.
 type: valkey
 aliases: [redis]
-image: "valkey/valkey:{{.Version}}-alpine"
+image: "registry.local/valkey/valkey:{{.Version}}-alpine"
 defaultVersion: "8"
 port: 6379
 portName: redis

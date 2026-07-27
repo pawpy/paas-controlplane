@@ -67,6 +67,14 @@ spec:
                     an operator adapter (postgres), a template descriptor (valkey, memcached, ...),
                     or, for an uncataloged type, the generic fallback (requires Image + Port).
                   properties:
+                    backup:
+                      description: |-
+                        Backup enables managed backups for operator-backed engines that support them
+                        (postgres: continuous WAL archiving + scheduled base backups to object
+                        storage via barman-cloud). This backup is also the clone-from-parent source
+                        for PR-preview environments (M5c). No-op for template/fallback engines, whose
+                        floor is a CSI volume snapshot.
+                      type: boolean
                     disk:
                       type: string
                     image:
@@ -80,8 +88,8 @@ spec:
                       default: small
                       type: string
                     port:
-                      description: Port is the server port for the FALLBACK path. Required
-                        when Image is set.
+                      description: Port is the server port for the FALLBACK path.
+                        Required when Image is set.
                       format: int32
                       type: integer
                     type:

@@ -93,6 +93,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := (&controller.EnvironmentReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to set up Environment controller")
+		os.Exit(1)
+	}
+
 	_ = mgr.AddHealthzCheck("healthz", healthz.Ping)
 	_ = mgr.AddReadyzCheck("readyz", healthz.Ping)
 

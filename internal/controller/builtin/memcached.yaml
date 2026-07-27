@@ -1,7 +1,7 @@
 # Memcached. Pure in-memory cache: no password, no persistence. Added as data only,
 # proving a new template service is a descriptor with zero Go.
 type: memcached
-image: "memcached:{{.Version}}-alpine"
+image: "registry.local/memcached:{{.Version}}-alpine"
 defaultVersion: "1.6"
 port: 11211
 portName: memcached

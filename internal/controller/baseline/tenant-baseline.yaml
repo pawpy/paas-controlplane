@@ -1,0 +1,148 @@
+# Tenant-namespace security baseline, stamped by the Environment controller into
+# every project/environment namespace it creates. ${NAMESPACE} is substituted at
+# reconcile time. This is the controller's authoritative copy of what used to be
+# applied by hand (kubectl+sed) from hetzner-k8s apps/controlplane/tenant-namespace/;
+# keep the two in sync (that dir is now the human-readable reference).
+#
+# NetworkPolicy is additive: default-deny plus a union of specific allows. Portable
+# networking.k8s.io/v1 (CNI-agnostic) except the apiserver egress, which needs a
+# CiliumNetworkPolicy (the apiserver ClusterIP maps to a backend identity, so a
+# plain ipBlock is unreliable).
+---
+# 1) Deny everything. Every other policy opens a specific hole.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: ${NAMESPACE}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# 2) DNS egress to kube-dns.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: ${NAMESPACE}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+---
+# 3) Intra-namespace: a project's services and its own backing DBs talk freely.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-namespace
+  namespace: ${NAMESPACE}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector: {}
+  egress:
+    - to:
+        - podSelector: {}
+---
+# 4) Ingress from the Envoy edge so public services are routable.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-from-edge
+  namespace: ${NAMESPACE}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: paas-system }
+---
+# 5) Egress to the public internet, minus cluster-internal/private ranges.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-internet
+  namespace: ${NAMESPACE}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+---
+# 6) Egress to the platform S3 endpoint (Ceph RGW, a 10.x ClusterIP the internet
+# rule excludes). Needed by `object` backings and by CNPG WAL archiving.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-object-storage
+  namespace: ${NAMESPACE}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: rook-ceph
+      ports:
+        - { port: 80, protocol: TCP }
+---
+# 7) Ingress from backing-service operator namespaces (CNPG scrapes instance
+# status/metrics). Scoped to operator namespaces, not all platform namespaces.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-backing-operators
+  namespace: ${NAMESPACE}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: cnpg-system
+---
+# 8) Egress to the apiserver (operator-managed instances watch their own CR).
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-apiserver-egress
+  namespace: ${NAMESPACE}
+spec:
+  endpointSelector: {}
+  egress:
+    - toEntities:
+        - kube-apiserver
+---
+# 9) Default per-container requests/limits (low request => overcommit pool).
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: defaults
+  namespace: ${NAMESPACE}
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "1"
+        memory: 512Mi
+      defaultRequest:
+        cpu: 10m
+        memory: 32Mi

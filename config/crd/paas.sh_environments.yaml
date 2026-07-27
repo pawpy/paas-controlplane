@@ -1,0 +1,283 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: environments.paas.sh
+spec:
+  group: paas.sh
+  names:
+    kind: Environment
+    listKind: EnvironmentList
+    plural: environments
+    singular: environment
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.project
+      name: Project
+      type: string
+    - jsonPath: .spec.type
+      name: Type
+      type: string
+    - jsonPath: .status.namespace
+      name: Namespace
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          Environment is a namespace-isolated instance of a project (persistent or a
+          preview), with its security baseline and optional app graph.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              EnvironmentSpec is one namespace-isolated instance of a project: a persistent
+              environment (production/staging) or an ephemeral preview (a PR environment,
+              torn down with the Environment). The controller creates the namespace
+              `proj-<project>-<name>`, stamps the tenant security baseline (default-deny
+              NetworkPolicies, apiserver/operator/object-storage allows, LimitRange), and, if
+              a Stack is given, deploys the whole app graph into it.
+            properties:
+              cloneFrom:
+                description: |-
+                  CloneFrom names a sibling Environment (same project) whose data a preview
+                  seeds from. Per-engine clone (postgres via CNPG bootstrap-from-backup, others
+                  via volume snapshot) is layered on top; recorded here as the source of record.
+                type: string
+              project:
+                description: Project groups environments; the namespace is `proj-<project>-<name>`.
+                type: string
+              stack:
+                description: |-
+                  Stack is the application graph deployed into this environment's namespace.
+                  Optional: an Environment may just be a prepared, isolated namespace.
+                properties:
+                  backing:
+                    description: |-
+                      Backing are the self-hosted data services (postgres, valkey, ...).
+                      Recorded now; provisioned by the catalog in M5b.
+                    items:
+                      description: |-
+                        BackingSpec references a catalog data service. `Type` selects the catalog tier:
+                        an operator adapter (postgres), a template descriptor (valkey, memcached, ...),
+                        or, for an uncataloged type, the generic fallback (requires Image + Port).
+                      properties:
+                        backup:
+                          description: |-
+                            Backup enables managed backups for operator-backed engines that support them
+                            (postgres: continuous WAL archiving + scheduled base backups to object
+                            storage via barman-cloud). This backup is also the clone-from-parent source
+                            for PR-preview environments (M5c). No-op for template/fallback engines, whose
+                            floor is a CSI volume snapshot.
+                          type: boolean
+                        disk:
+                          type: string
+                        image:
+                          description: |-
+                            Image is the OCI ref for the generic FALLBACK path (uncataloged type). Ignored
+                            for operator- and template-backed types, which pick their own image.
+                          type: string
+                        name:
+                          type: string
+                        plan:
+                          default: small
+                          type: string
+                        port:
+                          description: Port is the server port for the FALLBACK path.
+                            Required when Image is set.
+                          format: int32
+                          type: integer
+                        type:
+                          type: string
+                        version:
+                          type: string
+                      required:
+                      - name
+                      - type
+                      type: object
+                    type: array
+                  services:
+                    description: Services are the application services built from
+                      the repo.
+                    items:
+                      description: ServiceSpec is one buildable unit that runs as
+                        one or more processes.
+                      properties:
+                        build:
+                          description: Build describes how to produce the image from
+                            the repo (not yet wired).
+                          properties:
+                            dockerfile:
+                              type: string
+                            repoSubdir:
+                              type: string
+                          type: object
+                        connections:
+                          description: |-
+                            Connections are typed edges to other services or backing services.
+                            M5a resolves intra-stack service edges (injects an internal URL);
+                            backing-service edges are recorded for M5b.
+                          items:
+                            description: |-
+                              ConnectionSpec is a typed edge. `To` names a service or backing service in the
+                              stack; `As` is the env var the consumer expects the connection under.
+                            properties:
+                              as:
+                                type: string
+                              to:
+                                type: string
+                            required:
+                            - to
+                            type: object
+                          type: array
+                        env:
+                          description: Env is injected into every process of this
+                            service.
+                          items:
+                            description: EnvVar is a plain name/value environment
+                              variable for the app process.
+                            properties:
+                              name:
+                                type: string
+                              value:
+                                type: string
+                            required:
+                            - name
+                            type: object
+                          type: array
+                        hooks:
+                          description: Hooks.release runs to completion (as a Job)
+                            before the processes roll.
+                          properties:
+                            release:
+                              description: Release runs to completion before the new
+                                processes roll (migrations).
+                              type: string
+                          type: object
+                        image:
+                          description: |-
+                            Image is the OCI ref to run. M5a uses this directly; Build (repo -> image
+                            via the fleet) is wired in a later milestone.
+                          type: string
+                        name:
+                          type: string
+                        processes:
+                          description: Processes are the deployables from this one
+                            image (web, worker, cron).
+                          items:
+                            description: ProcessSpec is one deployable of a service.
+                            properties:
+                              command:
+                                description: Command is run via `sh -c`. Empty uses
+                                  the image entrypoint.
+                                type: string
+                              kind:
+                                default: web
+                                description: Kind is web|worker|cron (informational
+                                  for M5a; cron -> CronJob later).
+                                type: string
+                              name:
+                                type: string
+                              port:
+                                description: Port, if >0, exposes a Service and (later)
+                                  an edge domain.
+                                format: int32
+                                type: integer
+                              replicas:
+                                default: 1
+                                format: int32
+                                type: integer
+                              resources:
+                                description: |-
+                                  Resources is the per-replica limit. Requests are set low by the operator so
+                                  the tenant pool can overcommit; these are the ceilings.
+                                properties:
+                                  cpu:
+                                    default: 500m
+                                    type: string
+                                  memory:
+                                    default: 512Mi
+                                    type: string
+                                type: object
+                            required:
+                            - name
+                            type: object
+                          type: array
+                      required:
+                      - name
+                      type: object
+                    type: array
+                  volumes:
+                    description: Volumes are named storage claims (block|file|object).
+                      Recorded now.
+                    items:
+                      description: VolumeSpec is a named storage claim.
+                      properties:
+                        kind:
+                          default: block
+                          type: string
+                        name:
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                type: object
+              type:
+                default: persistent
+                description: |-
+                  Type is "persistent" (long-lived) or "preview" (ephemeral PR env). Governs
+                  teardown expectations and data-clone behaviour.
+                enum:
+                - persistent
+                - preview
+                type: string
+            required:
+            - project
+            type: object
+          status:
+            description: EnvironmentStatus is the observed state.
+            properties:
+              baselineStamped:
+                description: BaselineStamped records that the security baseline was
+                  applied.
+                type: boolean
+              namespace:
+                description: Namespace is the project/environment namespace the controller
+                  manages.
+                type: string
+              observedGeneration:
+                format: int64
+                type: integer
+              phase:
+                description: 'Phase: Provisioning -> Ready (namespace + baseline stamped,
+                  Stack applied).'
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

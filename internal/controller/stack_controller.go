@@ -36,6 +36,18 @@ var cnpgClusterGVK = schema.GroupVersionKind{Group: "postgresql.cnpg.io", Versio
 // for the same reason: no build dependency on the lib-bucket-provisioner module.
 var obcGVK = schema.GroupVersionKind{Group: "objectbucket.io", Version: "v1alpha1", Kind: "ObjectBucketClaim"}
 
+// scheduledBackupGVK is the CNPG ScheduledBackup type (drives periodic base
+// backups; unstructured, no module dependency like cnpgClusterGVK).
+var scheduledBackupGVK = schema.GroupVersionKind{Group: "postgresql.cnpg.io", Version: "v1", Kind: "ScheduledBackup"}
+
+// pgImageRepo is the mirrored CloudNativePG postgres image (barman-cloud built in),
+// pinned in registry.local by apps/image-mirror. pgDefaultVersion is used when a
+// postgres backing does not pin a version. Keep in lockstep with the mirror list.
+const (
+	pgImageRepo      = "registry.local/cloudnative-pg/postgresql"
+	pgDefaultVersion = "17.2"
+)
+
 // StackReconciler drives a Stack toward: backing data services (self-hosted via
 // operators), then for each service a release Job (if it has a release hook) run
 // to completion, then a Deployment per process (+ a Service for ported
@@ -75,7 +87,7 @@ type backing struct {
 // +kubebuilder:rbac:groups="",resources=services;secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=postgresql.cnpg.io,resources=clusters,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=postgresql.cnpg.io,resources=clusters;scheduledbackups;backups,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=objectbucket.io,resources=objectbucketclaims,verbs=get;list;watch;create;update;patch;delete
 
 func (r *StackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -215,13 +227,33 @@ func (r *StackReconciler) reconcileBacking(ctx context.Context, stack *paasv1.St
 }
 
 // reconcilePostgres ensures a CloudNativePG Cluster for a postgres backing and
-// returns readiness + the app Secret name. The image comes from the version for
-// now; it moves behind the registry.local mirror in M5b-4.
+// returns readiness + the app Secret name. The image is the mirrored CNPG postgres
+// (registry.local, via apps/image-mirror). When the backing opts into backups it
+// also provisions a dedicated object-storage bucket and wires continuous WAL +
+// scheduled base backups to it (barman-cloud, in-tree in CNPG 1.30) — the same
+// backup that a PR-preview environment clones from (M5c).
 func (r *StackReconciler) reconcilePostgres(ctx context.Context, stack *paasv1.Stack, b *paasv1.BackingSpec) (ready bool, secretName string, err error) {
 	name := fmt.Sprintf("%s-%s", stack.Name, b.Name)
 	disk := b.Disk
 	if disk == "" {
 		disk = "1Gi"
+	}
+	version := b.Version
+	if version == "" {
+		version = pgDefaultVersion
+	}
+
+	// Backups: provision a bucket first. WAL archiving needs its creds Secret to
+	// exist before the cluster references it, so hold off wiring barmanObjectStore
+	// until the OBC is Bound (its Secret + ConfigMap are then present). The cluster
+	// still comes up in the meantime; backups activate once the bucket binds.
+	backupBucket, backupReady := "", false
+	if b.Backup {
+		var berr error
+		backupReady, backupBucket, berr = r.ensureBucket(ctx, stack, name+"-backup")
+		if berr != nil {
+			return false, "", berr
+		}
 	}
 
 	cl := &unstructured.Unstructured{}
@@ -236,8 +268,22 @@ func (r *StackReconciler) reconcilePostgres(ctx context.Context, stack *paasv1.S
 		_ = unstructured.SetNestedField(cl.Object, "ceph-block", "spec", "storage", "storageClass")
 		_ = unstructured.SetNestedField(cl.Object, "app", "spec", "bootstrap", "initdb", "database")
 		_ = unstructured.SetNestedField(cl.Object, "app", "spec", "bootstrap", "initdb", "owner")
-		if b.Version != "" {
-			_ = unstructured.SetNestedField(cl.Object, "ghcr.io/cloudnative-pg/postgresql:"+b.Version, "spec", "imageName")
+		_ = unstructured.SetNestedField(cl.Object, pgImageRepo+":"+version, "spec", "imageName")
+		if backupReady {
+			_ = unstructured.SetNestedMap(cl.Object, map[string]interface{}{
+				"destinationPath": "s3://" + backupBucket,
+				"endpointURL":     r.ObjectEndpoint,
+				"s3Credentials": map[string]interface{}{
+					"accessKeyId":     map[string]interface{}{"name": name + "-backup", "key": "AWS_ACCESS_KEY_ID"},
+					"secretAccessKey": map[string]interface{}{"name": name + "-backup", "key": "AWS_SECRET_ACCESS_KEY"},
+				},
+				"wal": map[string]interface{}{"compression": "gzip"},
+				// immediateCheckpoint forces a fast checkpoint at backup start instead
+				// of the default "spread" one, which on an idle DB waits up to
+				// checkpoint_timeout (5m) before the base backup makes progress.
+				"data": map[string]interface{}{"compression": "gzip", "immediateCheckpoint": true},
+			}, "spec", "backup", "barmanObjectStore")
+			_ = unstructured.SetNestedField(cl.Object, "30d", "spec", "backup", "retentionPolicy")
 		}
 		// Single converged box: CNPG's Postgres pods must tolerate the
 		// control-plane taint (CNPG places tolerations under spec.affinity).
@@ -255,8 +301,37 @@ func (r *StackReconciler) reconcilePostgres(ctx context.Context, stack *paasv1.S
 		return false, "", fmt.Errorf("cnpg cluster %s: %w", name, err)
 	}
 
+	// A ScheduledBackup (immediate + daily) gives a base backup to archive against
+	// and to clone previews from. Only once the bucket is wired.
+	if backupReady {
+		if err = r.ensureScheduledBackup(ctx, stack, name); err != nil {
+			return false, "", err
+		}
+	}
+
 	readyInstances, _, _ := unstructured.NestedInt64(cl.Object, "status", "readyInstances")
 	return readyInstances >= 1, name + "-app", nil
+}
+
+// ensureScheduledBackup drives a daily base backup for a CNPG cluster (immediate:
+// true so the first one runs right away — the recovery/clone base). Named after
+// the cluster, owned by the Stack.
+func (r *StackReconciler) ensureScheduledBackup(ctx context.Context, stack *paasv1.Stack, clusterName string) error {
+	sb := &unstructured.Unstructured{}
+	sb.SetGroupVersionKind(scheduledBackupGVK)
+	sb.SetNamespace(stack.Namespace)
+	sb.SetName(clusterName)
+	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, sb, func() error {
+		// CNPG cron is 6-field (leading seconds): 3am daily.
+		_ = unstructured.SetNestedField(sb.Object, "0 0 3 * * *", "spec", "schedule")
+		_ = unstructured.SetNestedField(sb.Object, true, "spec", "immediate")
+		_ = unstructured.SetNestedField(sb.Object, "self", "spec", "backupOwnerReference")
+		_ = unstructured.SetNestedField(sb.Object, clusterName, "spec", "cluster", "name")
+		return controllerutil.SetControllerReference(stack, sb, r.Scheme)
+	}); err != nil {
+		return fmt.Errorf("scheduledbackup %s: %w", clusterName, err)
+	}
+	return nil
 }
 
 // postgresEnv binds a postgres connection: `as` gets the full connection URI, and
@@ -280,21 +355,39 @@ func postgresEnv(secret, as string) []corev1.EnvVar {
 // (Ceph RGW), not a managed cloud bucket. Ready = OBC phase Bound.
 func (r *StackReconciler) reconcileObject(ctx context.Context, stack *paasv1.Stack, b *paasv1.BackingSpec) (ready bool, name string, err error) {
 	name = fmt.Sprintf("%s-%s", stack.Name, b.Name)
+	ready, _, err = r.ensureBucket(ctx, stack, name)
+	return ready, name, err
+}
+
+// ensureBucket creates/updates an ObjectBucketClaim and reports whether it is
+// Bound plus the generated bucket name. Rook names the claim's creds Secret and
+// its ConfigMap (which carries BUCKET_NAME) after the OBC, in the stack namespace.
+// Used both for `object` backings (the app reads creds by ref) and for CNPG backup
+// buckets (the controller needs the concrete bucket name for the barman path).
+func (r *StackReconciler) ensureBucket(ctx context.Context, stack *paasv1.Stack, obcName string) (bound bool, bucketName string, err error) {
 	obc := &unstructured.Unstructured{}
 	obc.SetGroupVersionKind(obcGVK)
 	obc.SetNamespace(stack.Namespace)
-	obc.SetName(name)
+	obc.SetName(obcName)
 	if _, err = controllerutil.CreateOrUpdate(ctx, r.Client, obc, func() error {
 		// generateBucketName gives a unique bucket per claim; the real name lands
-		// in the generated ConfigMap's BUCKET_NAME (the app reads it from env).
-		_ = unstructured.SetNestedField(obc.Object, name, "spec", "generateBucketName")
+		// in the generated ConfigMap's BUCKET_NAME.
+		_ = unstructured.SetNestedField(obc.Object, obcName, "spec", "generateBucketName")
 		_ = unstructured.SetNestedField(obc.Object, r.ObjectStorageClass, "spec", "storageClassName")
 		return controllerutil.SetControllerReference(stack, obc, r.Scheme)
 	}); err != nil {
-		return false, "", fmt.Errorf("objectbucketclaim %s: %w", name, err)
+		return false, "", fmt.Errorf("objectbucketclaim %s: %w", obcName, err)
 	}
-	phase, _, _ := unstructured.NestedString(obc.Object, "status", "phase")
-	return phase == "Bound", name, nil
+	if phase, _, _ := unstructured.NestedString(obc.Object, "status", "phase"); phase != "Bound" {
+		return false, "", nil
+	}
+	// The generated ConfigMap (same name as the OBC) carries BUCKET_NAME; it lands
+	// right after the OBC binds, so a not-found here is just a race — requeue.
+	var cm corev1.ConfigMap
+	if err = r.Get(ctx, types.NamespacedName{Namespace: stack.Namespace, Name: obcName}, &cm); err != nil {
+		return false, "", client.IgnoreNotFound(err)
+	}
+	return true, cm.Data["BUCKET_NAME"], nil
 }
 
 // objectEnv binds an object connection. Credentials come by Secret reference and

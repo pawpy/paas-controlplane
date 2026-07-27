@@ -88,6 +88,12 @@ type BackingSpec struct {
 	Image string `json:"image,omitempty"`
 	// Port is the server port for the FALLBACK path. Required when Image is set.
 	Port int32 `json:"port,omitempty"`
+	// Backup enables managed backups for operator-backed engines that support them
+	// (postgres: continuous WAL archiving + scheduled base backups to object
+	// storage via barman-cloud). This backup is also the clone-from-parent source
+	// for PR-preview environments (M5c). No-op for template/fallback engines, whose
+	// floor is a CSI volume snapshot.
+	Backup bool `json:"backup,omitempty"`
 }
 
 // VolumeSpec is a named storage claim.
