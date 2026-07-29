@@ -14,6 +14,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	paasv1 "github.com/pawpy/paas-controlplane/api/v1alpha1"
+	"github.com/pawpy/paas-controlplane/internal/api"
 	"github.com/pawpy/paas-controlplane/internal/controller"
 )
 
@@ -98,6 +99,24 @@ func main() {
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to set up Environment controller")
+		os.Exit(1)
+	}
+
+	// The canvas UI's read/write surface (M5e). Runs in-process so it reads off the
+	// same informer cache the reconcilers use and can stream cache watch events as
+	// the digital-twin overlay. ClusterIP-only: no authn here yet, see internal/api.
+	apiAddr := os.Getenv("PAAS_API_ADDR")
+	if apiAddr == "" {
+		apiAddr = ":8082"
+	}
+	if err := mgr.Add(&api.Server{
+		Addr:    apiAddr,
+		Client:  mgr.GetClient(),
+		Cache:   mgr.GetCache(),
+		Catalog: builtins.Entries(),
+		Log:     ctrl.Log.WithName("api"),
+	}); err != nil {
+		setupLog.Error(err, "unable to set up canvas API")
 		os.Exit(1)
 	}
 
